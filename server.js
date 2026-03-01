@@ -1,76 +1,106 @@
 const http = require("http");
 const { Pool } = require("pg");
 
+// --------------------
+// DB
+// --------------------
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
+  // Render Postgres commonly needs SSL; safe for hosted DBs
   ssl: process.env.DATABASE_URL ? { rejectUnauthorized: false } : undefined
 });
 
 async function ensureTables() {
+  // Audit log table
   await pool.query(`
     CREATE TABLE IF NOT EXISTS audit_log (
       id BIGSERIAL PRIMARY KEY,
-      ts TIMESTAMPTZ DEFAULT NOW(),
-      event_type TEXT,
-      details JSONB
+      ts TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      event_type TEXT NOT NULL,
+      details JSONB NOT NULL DEFAULT '{}'::jsonb
     );
   `);
 
+  // Rules/config storage
   await pool.query(`
     CREATE TABLE IF NOT EXISTS app_config (
       key TEXT PRIMARY KEY,
-      value JSONB
+      value JSONB NOT NULL DEFAULT '{}'::jsonb,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
   `);
 
+  // Owner alert feed (for you to review)
   await pool.query(`
     CREATE TABLE IF NOT EXISTS owner_alerts (
       id BIGSERIAL PRIMARY KEY,
-      ts TIMESTAMPTZ DEFAULT NOW(),
-      severity TEXT,
-      title TEXT,
-      message TEXT,
-      meta JSONB
+      ts TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      severity TEXT NOT NULL DEFAULT 'info',
+      title TEXT NOT NULL,
+      message TEXT NOT NULL,
+      meta JSONB NOT NULL DEFAULT '{}'::jsonb
     );
   `);
 }
 
-async function logEvent(type, details = {}) {
-  await pool.query(
-    `INSERT INTO audit_log (event_type, details) VALUES ($1, $2)`,
-    [type, details]
-  );
+async function logEvent(eventType, details = {}) {
+  try {
+    await pool.query(
+      `INSERT INTO audit_log (event_type, details) VALUES ($1, $2::jsonb)`,
+      [eventType, JSON.stringify(details)]
+    );
+  } catch (e) {
+    // Never crash the server if logging fails
+    console.error("Audit log insert failed:", e?.message || e);
+  }
 }
 
 async function setConfig(key, value) {
   await pool.query(
-    `INSERT INTO app_config (key, value)
-     VALUES ($1, $2)
-     ON CONFLICT (key)
-     DO UPDATE SET value = EXCLUDED.value`,
-    [key, value]
+    `
+    INSERT INTO app_config (key, value, updated_at)
+    VALUES ($1, $2::jsonb, NOW())
+    ON CONFLICT (key) DO UPDATE
+      SET value = EXCLUDED.value, updated_at = NOW()
+    `,
+    [key, JSON.stringify(value)]
   );
 }
 
 async function getConfig(key) {
-  const r = await pool.query(`SELECT value FROM app_config WHERE key=$1`, [key]);
-  return r.rows[0]?.value;
+  const r = await pool.query(`SELECT value FROM app_config WHERE key = $1`, [key]);
+  return r.rows?.[0]?.value ?? null;
 }
 
+// --------------------
+// Owner Alerts
+// --------------------
 async function createAlert({ severity = "info", title, message, meta = {} }) {
   await pool.query(
     `INSERT INTO owner_alerts (severity, title, message, meta)
-     VALUES ($1, $2, $3, $4)`,
-    [severity, title, message, meta]
+     VALUES ($1, $2, $3, $4::jsonb)`,
+    [String(severity), String(title), String(message), JSON.stringify(meta || {})]
   );
 }
 
 async function listAlerts(limit = 25) {
+  const lim = Math.max(1, Math.min(100, Number(limit) || 25));
   const r = await pool.query(
-    `SELECT * FROM owner_alerts ORDER BY id DESC LIMIT $1`,
-    [limit]
+    `SELECT id, ts, severity, title, message, meta
+     FROM owner_alerts
+     ORDER BY id DESC
+     LIMIT $1`,
+    [lim]
   );
-  return r.rows;
+  return r.rows || [];
+}
+
+// --------------------
+// HTTP helpers
+// --------------------
+function unauthorized(res) {
+  res.writeHead(401, { "Content-Type": "text/plain" });
+  res.end("Unauthorized");
 }
 
 function json(res, status, obj) {
@@ -79,122 +109,290 @@ function json(res, status, obj) {
 }
 
 function readBody(req) {
-  return new Promise((resolve) => {
+  return new Promise((resolve, reject) => {
     let data = "";
-    req.on("data", chunk => data += chunk);
+    req.on("data", chunk => (data += chunk));
     req.on("end", () => resolve(data));
+    req.on("error", reject);
   });
 }
 
-async function openaiChatJSON(system, user) {
+// --------------------
+// OpenAI helper (JSON only)
+// --------------------
+async function openaiChatJSON({ system, user, maxTokens = 900 }) {
+  const apiKey = process.env.OPENAI_API_KEY;
+  if (!apiKey) return { error: "OPENAI_API_KEY not set" };
+
+  const payload = {
+    model: "gpt-4.1-mini",
+    messages: [
+      { role: "system", content: system },
+      { role: "user", content: user }
+    ],
+    temperature: 0,
+    max_tokens: maxTokens
+  };
+
   const resp = await fetch("https://api.openai.com/v1/chat/completions", {
     method: "POST",
     headers: {
-      Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+      Authorization: `Bearer ${apiKey}`,
       "Content-Type": "application/json"
     },
-    body: JSON.stringify({
-      model: "gpt-4.1-mini",
-      temperature: 0,
-      messages: [
-        { role: "system", content: system },
-        { role: "user", content: user }
-      ]
-    })
+    body: JSON.stringify(payload)
   });
 
+  if (!resp.ok) {
+    const errText = await resp.text();
+    return { error: `OpenAI error: ${resp.status} ${errText}` };
+  }
+
   const data = await resp.json();
-  return JSON.parse(data.choices[0].message.content);
+  const content = data?.choices?.[0]?.message?.content?.trim() || "{}";
+
+  try {
+    return JSON.parse(content);
+  } catch {
+    return { error: "Model returned non-JSON", raw: content };
+  }
 }
 
-let ready = false;
+// --------------------
+// Draft logic helpers
+// --------------------
+function isNonEmptyString(x) {
+  return typeof x === "string" && x.trim().length > 0;
+}
+
+// Allowlist load_context keys (guardrail)
+function normalizeLoadContext(ctx = {}) {
+  const safe = {
+    pickup_fcfs_or_appt: ctx.pickup_fcfs_or_appt ?? null,
+    pickup_time_window_military: ctx.pickup_time_window_military ?? null,
+    pickup_city_state: ctx.pickup_city_state ?? null,
+    delivery_fcfs_or_appt: ctx.delivery_fcfs_or_appt ?? null,
+    delivery_time_window_military: ctx.delivery_time_window_military ?? null,
+    delivery_city_state: ctx.delivery_city_state ?? null,
+    weight_lbs: ctx.weight_lbs ?? null,
+    commodity_desc: ctx.commodity_desc ?? null,
+    posted_rate: ctx.posted_rate ?? null,
+    midpoint_rate: ctx.midpoint_rate ?? null,
+    rateview_low: ctx.rateview_low ?? null,
+    rateview_high: ctx.rateview_high ?? null
+  };
+
+  for (const k of Object.keys(safe)) {
+    if (typeof safe[k] === "string") safe[k] = safe[k].trim();
+  }
+  return safe;
+}
+
+function hasAllLoadDetails(loadContext) {
+  return (
+    isNonEmptyString(loadContext.pickup_fcfs_or_appt) &&
+    isNonEmptyString(loadContext.pickup_time_window_military) &&
+    isNonEmptyString(loadContext.pickup_city_state) &&
+    isNonEmptyString(loadContext.delivery_fcfs_or_appt) &&
+    isNonEmptyString(loadContext.delivery_time_window_military) &&
+    isNonEmptyString(loadContext.delivery_city_state) &&
+    (typeof loadContext.weight_lbs === "number" ||
+      isNonEmptyString(String(loadContext.weight_lbs || ""))) &&
+    isNonEmptyString(loadContext.commodity_desc)
+  );
+}
+
+// --------------------
+// Server
+// --------------------
+let tablesReady = false;
 
 const server = http.createServer(async (req, res) => {
-
+  // AUTH (locked server)
   const token = req.headers["authorization"];
-  if (token !== `Bearer ${process.env.AUTH_TOKEN}`) {
-    return res.writeHead(401).end("Unauthorized");
+  const expected = process.env.AUTH_TOKEN;
+
+  if (!expected) return json(res, 500, { error: "Server misconfigured: missing AUTH_TOKEN" });
+  if (!token || token !== `Bearer ${expected}`) return unauthorized(res);
+
+  // Initialize DB tables once per process
+  if (!tablesReady) {
+    try {
+      await ensureTables();
+      tablesReady = true;
+      await logEvent("server_start", { ok: true });
+    } catch (e) {
+      return json(res, 500, { error: "DB init failed", details: e?.message || String(e) });
+    }
   }
 
-  if (!ready) {
-    await ensureTables();
-    ready = true;
-  }
-
-  // HEALTH
-  if (req.url === "/health") {
+  // --------------------
+  // ROUTES
+  // --------------------
+  if (req.url === "/health" && req.method === "GET") {
+    await logEvent("health_check", {});
     return json(res, 200, { ok: true });
   }
 
-  // CONFIG
+  // Rules config
   if (req.url === "/config/rules" && req.method === "POST") {
-    const body = JSON.parse(await readBody(req));
+    const bodyText = await readBody(req);
+    let body;
+    try {
+      body = JSON.parse(bodyText || "{}");
+    } catch {
+      await logEvent("config_rules_error", { reason: "invalid_json" });
+      return json(res, 400, { error: "Invalid JSON body" });
+    }
+
     await setConfig("rules", body);
+    await logEvent("config_rules_saved", { keys: Object.keys(body || {}) });
     return json(res, 200, { ok: true });
   }
 
   if (req.url === "/config/rules" && req.method === "GET") {
     const rules = await getConfig("rules");
+    await logEvent("config_rules_read", {});
     return json(res, 200, { rules });
   }
 
-  // ALERTS
+  // Owner alerts (create)
   if (req.url === "/alerts" && req.method === "POST") {
-    const body = JSON.parse(await readBody(req));
-    await createAlert(body);
+    const bodyText = await readBody(req);
+    let body;
+    try {
+      body = JSON.parse(bodyText || "{}");
+    } catch {
+      await logEvent("alerts_error", { reason: "invalid_json" });
+      return json(res, 400, { error: "Invalid JSON body" });
+    }
+
+    const severity = (body.severity || "info").toString();
+    const title = (body.title || "").toString().slice(0, 140);
+    const message = (body.message || "").toString().slice(0, 2000);
+    const meta = body.meta && typeof body.meta === "object" ? body.meta : {};
+
+    if (!title || !message) return json(res, 400, { error: "Missing title or message" });
+
+    await createAlert({ severity, title, message, meta });
+    await logEvent("alert_created", { severity, title });
+
     return json(res, 200, { ok: true });
   }
 
+  // Owner alerts (list)
   if (req.url.startsWith("/alerts") && req.method === "GET") {
-    const alerts = await listAlerts();
+    const url = new URL(req.url, "https://dummy.local");
+    const limit = url.searchParams.get("limit") || "25";
+    const alerts = await listAlerts(limit);
+    await logEvent("alerts_listed", { count: alerts.length });
     return json(res, 200, { ok: true, alerts });
   }
 
-  // DRAFT REPLY
+  // Draft carrier reply (Phase 1, draft-only)
   if (req.url === "/draft/carrier-reply" && req.method === "POST") {
+    const rules = (await getConfig("rules")) || {};
+    const safetyMode = rules?.safety?.mode || "draft_only";
 
-    const body = JSON.parse(await readBody(req));
-    const rules = await getConfig("rules");
+    const bodyText = await readBody(req);
+    let body;
+    try {
+      body = JSON.parse(bodyText || "{}");
+    } catch {
+      await logEvent("draft_reply_error", { reason: "invalid_json" });
+      return json(res, 400, { error: "Invalid JSON body" });
+    }
 
-    const email = body.email_text || "";
-    const ctx = body.load_context || {};
+    const emailText = (body.email_text || "").toString().slice(0, 12000);
+    if (!emailText) return json(res, 400, { error: "Missing email_text" });
+
+    const loadContext = normalizeLoadContext(body.load_context || {});
+    const haveAll = hasAllLoadDetails(loadContext);
 
     const system = `
-You are DKT Logistics' AI carrier assistant.
+You are DKT Logistics' carrier email assistant.
+You MUST follow the rules provided.
+You are in SAFETY MODE: ${safetyMode}.
+You are NOT allowed to send emails, post loads, or change any system. Draft only.
 
-FORMAT STRICTLY:
+Hard requirements:
+- Format load details EXACTLY as:
+  1) Picks up {pickup_fcfs_or_appt} {pickup_time_window_military} in {pickup_city_state}
+  2) Delivers to {delivery_city_state} {delivery_fcfs_or_appt} {delivery_time_window_military}
+  3) Truckload of {commodity_desc} weighing {weight_lbs}lbs
+- Ask for MC ONLY if you did not find it in the email.
+- If load_context contains the needed fields, DO NOT ask to confirm pickup/delivery times, weight, or commodity.
+- Keep tone polite, short, not overly formal.
 
-Picks up {pickup_fcfs_or_appt} {pickup_time_window_military} in {pickup_city_state}
-Delivers to {delivery_city_state} {delivery_fcfs_or_appt} {delivery_time_window_military}
-Truckload of {commodity_desc} weighing {weight_lbs}lbs
-
-Ask for MC ONLY if not found.
-Do NOT ask to confirm details if load_context provided.
-Return JSON only.
+Output ONLY valid JSON with keys:
+- lane_guess (string)
+- mc_found (boolean)
+- mc_value (string|null)
+- needs_mc_request (boolean)
+- draft_reply_text (string)
+- negotiation_next_line (string)
+- notes_for_owner (string)
 `;
 
     const user = `
-EMAIL:
-${email}
+RULES (JSON):
+${JSON.stringify(rules)}
 
-LOAD_CONTEXT:
-${JSON.stringify(ctx)}
+INCOMING EMAIL TEXT:
+${emailText}
+
+LOAD_CONTEXT (may be empty; if present, trust it):
+${JSON.stringify(loadContext)}
+
+TASK:
+1) Guess lane from email if present (e.g., "Seymour IN to Cookeville TN").
+2) Detect MC/DOT in the email if present. If none found, set mc_found=false and needs_mc_request=true.
+3) Draft reply using the 3-line required format. Use LOAD_CONTEXT values if provided.
+4) If LOAD_CONTEXT is missing key details, ask ONE short clarifying question:
+   "Can you confirm pickup/delivery times, weight, and commodity?"
+5) If MC is missing, include: "${rules?.email_handling?.ask_mc_if_missing || "What is your MC number?"}"
+6) Provide a short negotiation_next_line aligned with DKT strategy. Use posted_rate/midpoint_rate if provided.
+Return ONLY JSON.
 `;
 
-    const result = await openaiChatJSON(system, user);
+    const result = await openaiChatJSON({ system, user, maxTokens: 950 });
 
-    if (result.needs_mc_request) {
-      await createAlert({
-        severity: "info",
-        title: "MC missing",
-        message: `Carrier asked about ${result.lane_guess}`
-      });
+    await logEvent("draft_carrier_reply", {
+      lane_guess: result?.lane_guess,
+      mc_found: result?.mc_found,
+      used_load_context: haveAll
+    });
+
+    // Auto-alerts (draft-only)
+    try {
+      if (result?.needs_mc_request) {
+        await createAlert({
+          severity: "info",
+          title: "MC needed",
+          message: `Carrier asked about lane ${result?.lane_guess || "(unknown)"} but did not provide MC.`,
+          meta: { lane: result?.lane_guess || null }
+        });
+      }
+      // If carrier appears ready to book / "lets do it" (best-effort heuristic)
+      const lower = emailText.toLowerCase();
+      if (lower.includes("let's do it") || lower.includes("lets do it") || lower.includes("book it") || lower.includes("we can do it")) {
+        await createAlert({
+          severity: "high",
+          title: "Carrier ready to book",
+          message: `Carrier seems ready to book for lane ${result?.lane_guess || "(unknown)"} — review and proceed.`,
+          meta: { lane: result?.lane_guess || null }
+        });
+      }
+    } catch (e) {
+      // Alerts should never break the request
+      console.error("Alert creation failed:", e?.message || e);
     }
 
     return json(res, 200, { ok: true, result });
   }
 
-  json(res, 200, { status: "running" });
+  await logEvent("unknown_route", { path: req.url, method: req.method });
+  return json(res, 200, { status: "DKT AI server running (secured)" });
 });
 
-server.listen(10000);
+server.listen(10000, () => console.log("Server running on port 10000"));
