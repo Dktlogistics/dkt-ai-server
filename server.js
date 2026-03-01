@@ -113,7 +113,7 @@ function readBody(req) {
 }
 
 // --------------------
-// OpenAI helper (JSON only)
+// OpenAI helper (JSON only) - still used for draft carrier-reply
 // --------------------
 async function openaiChatJSON({ system, user, maxTokens = 900 }) {
   const apiKey = process.env.OPENAI_API_KEY;
@@ -154,12 +154,42 @@ async function openaiChatJSON({ system, user, maxTokens = 900 }) {
 }
 
 // --------------------
-// Draft helpers
+// Helpers
 // --------------------
 function isNonEmptyString(x) {
   return typeof x === "string" && x.trim().length > 0;
 }
 
+function numOrNull(x) {
+  const n = Number(x);
+  return Number.isFinite(n) ? n : null;
+}
+
+function roundTo5(n) {
+  return Math.round(n / 5) * 5;
+}
+
+function ceilTo25(n) {
+  return Math.ceil(n / 25) * 25;
+}
+
+function midpointFromLowHigh(low, high) {
+  const l = numOrNull(low);
+  const h = numOrNull(high);
+  if (l == null || h == null) return null;
+  return Math.round((l + h) / 2);
+}
+
+function parseRateFromText(text) {
+  const t = String(text || "");
+  const m1 = t.match(/\$\s*([0-9]{3,5})(?:\.[0-9]{1,2})?/);
+  if (m1) return numOrNull(m1[1]);
+  const m2 = t.match(/\b([0-9]{3,5})\b/);
+  if (m2) return numOrNull(m2[1]);
+  return null;
+}
+
+// Allowlist load_context keys (guardrail)
 function normalizeLoadContext(ctx = {}) {
   const safe = {
     pickup_fcfs_or_appt: ctx.pickup_fcfs_or_appt ?? null,
@@ -176,7 +206,6 @@ function normalizeLoadContext(ctx = {}) {
     rateview_high: ctx.rateview_high ?? null,
     lane_guess: ctx.lane_guess ?? null
   };
-
   for (const k of Object.keys(safe)) {
     if (typeof safe[k] === "string") safe[k] = safe[k].trim();
   }
@@ -197,21 +226,20 @@ function hasAllLoadDetails(loadContext) {
   );
 }
 
-function numOrNull(x) {
-  const n = Number(x);
-  return Number.isFinite(n) ? n : null;
+function formatPrice(rate) {
+  return `We’re at $${rate}.`;
 }
 
-function midpoint(low, high) {
-  const l = numOrNull(low);
-  const h = numOrNull(high);
-  if (l == null || h == null) return null;
-  return Math.round((l + h) / 2);
+function computeFirstCounter({ postedRate, carrierAsk, mid }) {
+  const gap = carrierAsk - postedRate;
+  let bump = gap * 0.35;
+  bump = Math.max(60, Math.min(120, bump));
+  let counter = postedRate + bump;
+  counter = roundTo5(counter);
+  if (mid != null) counter = Math.min(counter, mid);
+  return Math.round(counter);
 }
 
-// --------------------
-// Server
-// --------------------
 let tablesReady = false;
 
 const server = http.createServer(async (req, res) => {
@@ -222,7 +250,6 @@ const server = http.createServer(async (req, res) => {
   if (!expected) return json(res, 500, { error: "Server misconfigured: missing AUTH_TOKEN" });
   if (!token || token !== `Bearer ${expected}`) return unauthorized(res);
 
-  // Initialize DB tables once per process
   if (!tablesReady) {
     try {
       await ensureTables();
@@ -233,9 +260,7 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
-  // --------------------
-  // ROUTES
-  // --------------------
+  // Health
   if (req.url === "/health" && req.method === "GET") {
     await logEvent("health_check", {});
     return json(res, 200, { ok: true });
@@ -251,7 +276,6 @@ const server = http.createServer(async (req, res) => {
       await logEvent("config_rules_error", { reason: "invalid_json" });
       return json(res, 400, { error: "Invalid JSON body" });
     }
-
     await setConfig("rules", body);
     await logEvent("config_rules_saved", { keys: Object.keys(body || {}) });
     return json(res, 200, { ok: true });
@@ -263,7 +287,7 @@ const server = http.createServer(async (req, res) => {
     return json(res, 200, { rules });
   }
 
-  // Owner alerts
+  // Alerts
   if (req.url === "/alerts" && req.method === "POST") {
     const bodyText = await readBody(req);
     let body;
@@ -318,50 +342,33 @@ const server = http.createServer(async (req, res) => {
     const system = `
 You are DKT Logistics' carrier email assistant.
 You MUST follow the rules provided.
-You are in SAFETY MODE: ${safetyMode}.
-You are NOT allowed to send emails, post loads, or change any system. Draft only.
+You are in SAFETY MODE: ${safetyMode}. Draft only.
 
 Hard requirements:
-- Format load details EXACTLY as:
+- Format EXACTLY:
   1) Picks up {pickup_fcfs_or_appt} {pickup_time_window_military} in {pickup_city_state}
   2) Delivers to {delivery_city_state} {delivery_fcfs_or_appt} {delivery_time_window_military}
   3) Truckload of {commodity_desc} weighing {weight_lbs}lbs
-- Ask for MC ONLY if you did not find it in the email.
-- If load_context contains the needed fields, DO NOT ask to confirm pickup/delivery times, weight, or commodity.
-- Keep tone polite, short, not overly formal.
+- Ask for MC ONLY if not found.
+- If load_context has details, DO NOT ask to confirm them.
+- Keep tone polite, short.
 
-Output ONLY valid JSON with keys:
-- lane_guess (string)
-- mc_found (boolean)
-- mc_value (string|null)
-- needs_mc_request (boolean)
-- draft_reply_text (string)
-- negotiation_next_line (string)
-- notes_for_owner (string)
+Return ONLY JSON with:
+lane_guess, mc_found, mc_value, needs_mc_request, draft_reply_text, negotiation_next_line, notes_for_owner
 `;
 
     const user = `
-RULES (JSON):
+RULES:
 ${JSON.stringify(rules)}
 
-INCOMING EMAIL TEXT:
+EMAIL:
 ${emailText}
 
-LOAD_CONTEXT (may be empty; if present, trust it):
+LOAD_CONTEXT (trust if present):
 ${JSON.stringify(loadContext)}
-
-TASK:
-1) Guess lane from email if present.
-2) Detect MC/DOT in the email if present. If none found, set mc_found=false and needs_mc_request=true.
-3) Draft reply using the 3-line required format. Use LOAD_CONTEXT values if provided.
-4) If LOAD_CONTEXT is missing key details, ask ONE short clarifying question:
-   "Can you confirm pickup/delivery times, weight, and commodity?"
-5) If MC is missing, include: "${rules?.email_handling?.ask_mc_if_missing || "What is your MC number?"}"
-6) Provide a short negotiation_next_line aligned with DKT strategy. Use posted_rate/midpoint_rate if provided.
-Return ONLY JSON.
 `;
 
-    const result = await openaiChatJSON({ system, user, maxTokens: 950 });
+    const result = await openaiChatJSON({ system, user, maxTokens: 900 });
 
     await logEvent("draft_carrier_reply", {
       lane_guess: result?.lane_guess,
@@ -369,7 +376,6 @@ Return ONLY JSON.
       used_load_context: haveAll
     });
 
-    // Auto-alerts
     try {
       if (result?.needs_mc_request) {
         await createAlert({
@@ -384,11 +390,8 @@ Return ONLY JSON.
     return json(res, 200, { ok: true, result });
   }
 
-  // NEW: Draft negotiation response (Phase 1, draft-only)
+  // Draft negotiation (deterministic, firm, short)
   if (req.url === "/draft/negotiate" && req.method === "POST") {
-    const rules = (await getConfig("rules")) || {};
-    const safetyMode = rules?.safety?.mode || "draft_only";
-
     const bodyText = await readBody(req);
     let body;
     try {
@@ -400,75 +403,142 @@ Return ONLY JSON.
 
     const emailText = (body.email_text || "").toString().slice(0, 12000);
     const loadContext = normalizeLoadContext(body.load_context || {});
-    const carrierAsk = numOrNull(body.carrier_ask_rate);
+    const lane = loadContext.lane_guess || null;
+
+    const negotiationRound = Math.max(1, Number(body.negotiation_round || 1));
+    const lastCounter = numOrNull(body.last_counter_rate);
+
     const postedRate = numOrNull(loadContext.posted_rate);
     const low = numOrNull(loadContext.rateview_low);
     const high = numOrNull(loadContext.rateview_high);
-    const mid = numOrNull(loadContext.midpoint_rate) ?? midpoint(low, high);
+    const mid = numOrNull(loadContext.midpoint_rate) ?? midpointFromLowHigh(low, high);
 
-    // Guardrail: if we don't have at least posted rate OR midpoint, we can still draft, but we should flag.
-    const system = `
-You are DKT Logistics' carrier negotiation assistant.
-SAFETY MODE: ${safetyMode}. Draft-only.
+    let carrierAsk = numOrNull(body.carrier_ask_rate);
+    if (carrierAsk == null) carrierAsk = parseRateFromText(emailText);
 
-You MUST follow these guardrails:
-- Never recommend paying above the RateView HIGH unless owner approves.
-- Prefer booking below MIDPOINT when possible; MIDPOINT is acceptable.
-- If carrier ask is far above posted rate, counter up but stay under midpoint if possible.
-- Keep tone polite and personal. You may use a light-load/fuel-angle if weight under 25000 lbs.
+    if (postedRate == null) {
+      await logEvent("draft_negotiate_error", { reason: "missing_posted_rate" });
+      return json(res, 400, { error: "Missing load_context.posted_rate" });
+    }
+    if (mid == null) {
+      await logEvent("draft_negotiate_error", { reason: "missing_midpoint" });
+      return json(res, 400, { error: "Missing midpoint (provide midpoint_rate or rateview_low/high)" });
+    }
 
-Return ONLY valid JSON with:
-- decision (accept|counter|escalate)
-- counter_rate (number|null)
-- max_rate_without_owner (number|null)   // typically = high
-- draft_reply_text (string)             // what to send the carrier (draft)
-- reasoning (string)                    // short explanation for owner
-- owner_alert (object|null)             // if escalate, include {severity,title,message,meta}
-`;
+    // Flag if carrier is within $100 of midpoint
+    if (carrierAsk != null && Math.abs(carrierAsk - mid) <= 100) {
+      try {
+        await createAlert({
+          severity: "high",
+          title: "Carrier offer near midpoint",
+          message: `Carrier asked $${carrierAsk} for ${lane || "lane"} (midpoint ~$${mid}). Recommend owner review/accept.`,
+          meta: { lane, carrierAsk, midpoint: mid, postedRate }
+        });
+      } catch {}
+    }
 
-    const user = `
-RULES JSON:
-${JSON.stringify(rules)}
+    // Above high => escalate
+    if (carrierAsk != null && high != null && carrierAsk > high) {
+      const result = {
+        decision: "escalate",
+        counter_rate: null,
+        midpoint_rate: mid,
+        max_rate_without_owner: high,
+        draft_reply_text: "",
+        reasoning: `Carrier ask $${carrierAsk} is above RateView high $${high}. Owner should handle.`,
+        owner_alert: {
+          severity: "high",
+          title: "Carrier ask above high",
+          message: `Carrier asked $${carrierAsk} (above high $${high}) for ${lane || "lane"}.`,
+          meta: { lane, carrierAsk, high, postedRate, midpoint: mid }
+        }
+      };
+      try {
+        await createAlert(result.owner_alert);
+      } catch {}
+      await logEvent("draft_negotiate", { lane, postedRate, mid, high, carrierAsk, decision: "escalate" });
+      return json(res, 200, { ok: true, result });
+    }
 
-CONTEXT:
-lane: ${loadContext.lane_guess || "(unknown)"}
-weight_lbs: ${loadContext.weight_lbs ?? "(unknown)"}
-posted_rate: ${postedRate ?? "(unknown)"}
-rateview_low: ${low ?? "(unknown)"}
-rateview_high: ${high ?? "(unknown)"}
-midpoint_rate: ${mid ?? "(unknown)"}
-carrier_ask_rate: ${carrierAsk ?? "(unknown)"}
+    // If no ask found, ask for it (short)
+    if (carrierAsk == null) {
+      const result = {
+        decision: "counter",
+        counter_rate: null,
+        midpoint_rate: mid,
+        max_rate_without_owner: high ?? null,
+        draft_reply_text: "What rate are you looking for?",
+        reasoning: "Carrier ask rate not provided/found. Request it.",
+        owner_alert: null
+      };
+      await logEvent("draft_negotiate", { lane, postedRate, mid, high, carrierAsk: null, decision: "ask_rate" });
+      return json(res, 200, { ok: true, result });
+    }
 
-CARRIER MESSAGE / EMAIL:
-${emailText}
+    // Round 1: compute first counter (e.g., 685)
+    const firstCounter = computeFirstCounter({ postedRate, carrierAsk, mid });
 
-TASK:
-- If carrier_ask_rate is not provided, infer it if the carrier states a rate in text; otherwise ask "What rate are you looking for?"
-- Produce a decision and a single best draft reply.
-- Enforce: never above HIGH without owner. If carrier asks above HIGH, decision must be escalate.
-`;
+    // Round 2: snap to next 25-grid ABOVE (firstCounter + 25) => 685 -> 725
+    // Round 3+: +25 steps from last counter
+    let counter = firstCounter;
 
-    const result = await openaiChatJSON({ system, user, maxTokens: 900 });
+    if (negotiationRound >= 2) {
+      const base = lastCounter != null ? lastCounter : firstCounter;
+
+      if (negotiationRound === 2) {
+        counter = ceilTo25(base + 25);
+      } else {
+        counter = base + 25 * (negotiationRound - 1);
+      }
+
+      counter = Math.min(counter, mid);
+      counter = roundTo5(counter);
+    }
+
+    // Final round: go to midpoint (default round 4+)
+    if (negotiationRound >= 4) {
+      counter = mid;
+    }
+
+    // Decision
+    let decision = "counter";
+    if (carrierAsk <= counter) decision = "accept";
+
+    const result = {
+      decision,
+      counter_rate: counter,
+      midpoint_rate: mid,
+      max_rate_without_owner: high ?? null,
+      draft_reply_text: formatPrice(counter),
+      reasoning: `Posted $${postedRate}, carrier asked $${carrierAsk}, midpoint ~$${mid}. Round ${negotiationRound} counter set to $${counter}.`,
+      owner_alert: null
+    };
+
+    // If we reached midpoint and still not accepted, flag owner
+    if (counter === mid && carrierAsk > mid) {
+      result.decision = "escalate";
+      result.owner_alert = {
+        severity: "high",
+        title: "Negotiation at midpoint",
+        message: `Negotiation reached midpoint $${mid} for ${lane || "lane"} and carrier still higher ($${carrierAsk}). Owner decision needed.`,
+        meta: { lane, postedRate, midpoint: mid, carrierAsk }
+      };
+      try {
+        await createAlert(result.owner_alert);
+      } catch {}
+    }
 
     await logEvent("draft_negotiate", {
-      lane: loadContext.lane_guess || null,
+      lane,
       postedRate,
       mid,
       high,
-      carrierAsk
+      carrierAsk,
+      negotiationRound,
+      lastCounter,
+      counter,
+      decision: result.decision
     });
-
-    // If model suggests escalation, create an owner alert
-    try {
-      if (result?.owner_alert && result?.owner_alert?.title) {
-        await createAlert({
-          severity: result.owner_alert.severity || "high",
-          title: result.owner_alert.title,
-          message: result.owner_alert.message || "Negotiation requires owner review.",
-          meta: result.owner_alert.meta || {}
-        });
-      }
-    } catch {}
 
     return json(res, 200, { ok: true, result });
   }
