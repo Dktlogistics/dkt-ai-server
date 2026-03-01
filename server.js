@@ -1,5 +1,26 @@
+/**
+ * DKT Logistics AI Agent (Draft-Only, Secured)
+ * - Node.js http server
+ * - Postgres audit log, config, alerts
+ * - Draft negotiation + draft email replies
+ * - Phase 2: Designated lane exclusion (ignore lanes fully)
+ * - Phase 3 prep: Draft-only load matching endpoint
+ */
+
 const http = require("http");
 const { Pool } = require("pg");
+
+// Use global fetch if available (Node 18+), otherwise undici
+let fetchFn = global.fetch;
+if (!fetchFn) {
+  try {
+    fetchFn = require("undici").fetch;
+  } catch (e) {
+    // If undici isn't installed, Render Node 18 is recommended.
+    // But we'll still fail gracefully in OpenAI calls.
+    fetchFn = null;
+  }
+}
 
 // --------------------
 // DB
@@ -112,12 +133,21 @@ function readBody(req) {
   });
 }
 
+function safeJsonParse(text) {
+  try {
+    return { ok: true, value: JSON.parse(text || "{}") };
+  } catch {
+    return { ok: false, value: null };
+  }
+}
+
 // --------------------
 // OpenAI helper (JSON only) - used for /draft/carrier-reply
 // --------------------
 async function openaiChatJSON({ system, user, maxTokens = 900 }) {
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) return { error: "OPENAI_API_KEY not set" };
+  if (!fetchFn) return { error: "fetch not available (install undici or use Node 18+)" };
 
   const payload = {
     model: "gpt-4.1-mini",
@@ -126,10 +156,12 @@ async function openaiChatJSON({ system, user, maxTokens = 900 }) {
       { role: "user", content: user }
     ],
     temperature: 0,
-    max_tokens: maxTokens
+    max_tokens: maxTokens,
+    // Stronger JSON compliance (supported by many chat models)
+    response_format: { type: "json_object" }
   };
 
-  const resp = await fetch("https://api.openai.com/v1/chat/completions", {
+  const resp = await fetchFn("https://api.openai.com/v1/chat/completions", {
     method: "POST",
     headers: {
       Authorization: `Bearer ${apiKey}`,
@@ -146,11 +178,9 @@ async function openaiChatJSON({ system, user, maxTokens = 900 }) {
   const data = await resp.json();
   const content = data?.choices?.[0]?.message?.content?.trim() || "{}";
 
-  try {
-    return JSON.parse(content);
-  } catch {
-    return { error: "Model returned non-JSON", raw: content };
-  }
+  const parsed = safeJsonParse(content);
+  if (!parsed.ok) return { error: "Model returned non-JSON", raw: content };
+  return parsed.value;
 }
 
 // --------------------
@@ -177,7 +207,6 @@ function midpointFromLowHigh(low, high) {
   const l = numOrNull(low);
   const h = numOrNull(high);
   if (l == null || h == null) return null;
-  // if low/high accidentally come in as 0/0, treat as invalid
   if (l <= 0 || h <= 0) return null;
   return Math.round((l + h) / 2);
 }
@@ -187,6 +216,17 @@ function parseRateFromText(text) {
   const m1 = t.match(/\$\s*([0-9]{3,5})(?:\.[0-9]{1,2})?/);
   if (m1) return numOrNull(m1[1]);
   const m2 = t.match(/\b([0-9]{3,5})\b/);
+  if (m2) return numOrNull(m2[1]);
+  return null;
+}
+
+function parseWeightFromText(text) {
+  const t = String(text || "").toLowerCase();
+  // Examples: 41500lbs, 41,500 lb, weight 42000
+  const m = t.match(/(\d{2,3}(?:,\d{3})+|\d{4,6})\s*(lbs|lb)\b/);
+  if (m) return numOrNull(m[1].replace(/,/g, ""));
+  // fallback: "weight 41500"
+  const m2 = t.match(/\bweight[:\s]*([0-9]{4,6})\b/);
   if (m2) return numOrNull(m2[1]);
   return null;
 }
@@ -213,6 +253,13 @@ function normalizeLoadContext(ctx = {}) {
   for (const k of Object.keys(safe)) {
     if (typeof safe[k] === "string") safe[k] = safe[k].trim();
   }
+
+  // Normalize weight to number if possible
+  if (safe.weight_lbs != null) {
+    const w = numOrNull(String(safe.weight_lbs).replace(/,/g, ""));
+    safe.weight_lbs = w ?? safe.weight_lbs;
+  }
+
   return safe;
 }
 
@@ -246,6 +293,101 @@ function computeFirstCounter({ postedRate, carrierAsk, mid }) {
 }
 
 // --------------------
+// Designated lane exclusion (Phase 2)
+// --------------------
+function normalizeLaneString(s) {
+  return String(s || "")
+    .toLowerCase()
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function laneFromContext(loadContext) {
+  // Prefer explicit lane_guess, else derive from pickup/delivery if present
+  if (isNonEmptyString(loadContext.lane_guess)) return loadContext.lane_guess.trim();
+  if (isNonEmptyString(loadContext.pickup_city_state) && isNonEmptyString(loadContext.delivery_city_state)) {
+    return `${loadContext.pickup_city_state} -> ${loadContext.delivery_city_state}`;
+  }
+  return "";
+}
+
+/**
+ * rules.designated_lanes can be:
+ * - ["Seymour IN -> Cookeville TN", "Houston TX -> Dallas TX"]
+ * - or objects: [{ pickup:"Seymour IN", delivery:"Cookeville TN" }, ...]
+ */
+function isDesignatedLane(loadContext, rules) {
+  const list = rules?.designated_lanes;
+  if (!Array.isArray(list) || list.length === 0) return false;
+
+  const lane = normalizeLaneString(laneFromContext(loadContext));
+  const pu = normalizeLaneString(loadContext.pickup_city_state || "");
+  const del = normalizeLaneString(loadContext.delivery_city_state || "");
+
+  for (const item of list) {
+    if (typeof item === "string") {
+      const target = normalizeLaneString(item);
+      if (target && lane === target) return true;
+      // allow short form "pickup -> delivery"
+      if (target && pu && del && target === normalizeLaneString(`${pu} -> ${del}`)) return true;
+    } else if (item && typeof item === "object") {
+      const tpu = normalizeLaneString(item.pickup || "");
+      const tdel = normalizeLaneString(item.delivery || "");
+      if (tpu && tdel && pu === tpu && del === tdel) return true;
+    }
+  }
+  return false;
+}
+
+// --------------------
+// Draft-only Load Matching (Phase 3 prep)
+// --------------------
+function normalizeCityState(s) {
+  return String(s || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function extractCityStateHints(emailText) {
+  // Very light heuristic; Phase 4 email-read can improve this later.
+  // We also accept user-provided candidate loads in the request, so this is "assist", not "source of truth".
+  const t = String(emailText || "");
+  // Try to pull "from X to Y" patterns
+  const m = t.match(/from\s+([A-Za-z\s]+?,?\s*[A-Z]{2})\s+to\s+([A-Za-z\s]+?,?\s*[A-Z]{2})/i);
+  return {
+    pickup_hint: m ? m[1] : null,
+    delivery_hint: m ? m[2] : null,
+    weight_hint: parseWeightFromText(t)
+  };
+}
+
+function scoreLoadMatch({ pickupHint, deliveryHint, weightHint }, load) {
+  const pu = normalizeCityState(load.pickup_city_state);
+  const del = normalizeCityState(load.delivery_city_state);
+
+  const puHint = normalizeCityState(pickupHint || "");
+  const delHint = normalizeCityState(deliveryHint || "");
+
+  let score = 0;
+
+  if (puHint && pu && (pu === puHint || pu.includes(puHint) || puHint.includes(pu))) score += 50;
+  if (delHint && del && (del === delHint || del.includes(delHint) || delHint.includes(del))) score += 50;
+
+  const wLoad = numOrNull(load.weight_lbs);
+  const wHint = numOrNull(weightHint);
+  if (wLoad != null && wHint != null) {
+    const diff = Math.abs(wLoad - wHint);
+    // 0 diff => +20, 500 diff => +10, 1000 diff => +0
+    const weightPoints = Math.max(0, Math.round(20 - diff / 50));
+    score += weightPoints;
+  }
+
+  return score;
+}
+
+// --------------------
 // Server
 // --------------------
 let tablesReady = false;
@@ -268,43 +410,44 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
+  // Parse URL safely for query strings
+  const urlObj = new URL(req.url, "https://dummy.local");
+  const pathname = urlObj.pathname;
+
   // Health
-  if (req.url === "/health" && req.method === "GET") {
+  if (pathname === "/health" && req.method === "GET") {
     await logEvent("health_check", {});
     return json(res, 200, { ok: true });
   }
 
   // Rules config
-  if (req.url === "/config/rules" && req.method === "POST") {
+  if (pathname === "/config/rules" && req.method === "POST") {
     const bodyText = await readBody(req);
-    let body;
-    try {
-      body = JSON.parse(bodyText || "{}");
-    } catch {
+    const parsed = safeJsonParse(bodyText);
+    if (!parsed.ok) {
       await logEvent("config_rules_error", { reason: "invalid_json" });
       return json(res, 400, { error: "Invalid JSON body" });
     }
-    await setConfig("rules", body);
-    await logEvent("config_rules_saved", { keys: Object.keys(body || {}) });
+    await setConfig("rules", parsed.value);
+    await logEvent("config_rules_saved", { keys: Object.keys(parsed.value || {}) });
     return json(res, 200, { ok: true });
   }
 
-  if (req.url === "/config/rules" && req.method === "GET") {
+  if (pathname === "/config/rules" && req.method === "GET") {
     const rules = await getConfig("rules");
     await logEvent("config_rules_read", {});
     return json(res, 200, { rules });
   }
 
   // Alerts
-  if (req.url === "/alerts" && req.method === "POST") {
+  if (pathname === "/alerts" && req.method === "POST") {
     const bodyText = await readBody(req);
-    let body;
-    try {
-      body = JSON.parse(bodyText || "{}");
-    } catch {
+    const parsed = safeJsonParse(bodyText);
+    if (!parsed.ok) {
       await logEvent("alerts_error", { reason: "invalid_json" });
       return json(res, 400, { error: "Invalid JSON body" });
     }
+    const body = parsed.value;
 
     const severity = (body.severity || "info").toString();
     const title = (body.title || "").toString().slice(0, 140);
@@ -319,32 +462,53 @@ const server = http.createServer(async (req, res) => {
     return json(res, 200, { ok: true });
   }
 
-  if (req.url.startsWith("/alerts") && req.method === "GET") {
-    const url = new URL(req.url, "https://dummy.local");
-    const limit = url.searchParams.get("limit") || "25";
+  if (pathname === "/alerts" && req.method === "GET") {
+    const limit = urlObj.searchParams.get("limit") || "25";
     const alerts = await listAlerts(limit);
     await logEvent("alerts_listed", { count: alerts.length });
     return json(res, 200, { ok: true, alerts });
   }
 
   // Draft carrier reply (Phase 1)
-  if (req.url === "/draft/carrier-reply" && req.method === "POST") {
+  if (pathname === "/draft/carrier-reply" && req.method === "POST") {
     const rules = (await getConfig("rules")) || {};
     const safetyMode = rules?.safety?.mode || "draft_only";
 
     const bodyText = await readBody(req);
-    let body;
-    try {
-      body = JSON.parse(bodyText || "{}");
-    } catch {
+    const parsed = safeJsonParse(bodyText);
+    if (!parsed.ok) {
       await logEvent("draft_reply_error", { reason: "invalid_json" });
       return json(res, 400, { error: "Invalid JSON body" });
     }
+    const body = parsed.value;
 
     const emailText = (body.email_text || "").toString().slice(0, 12000);
     if (!emailText) return json(res, 400, { error: "Missing email_text" });
 
     const loadContext = normalizeLoadContext(body.load_context || {});
+
+    // Phase 2: designated lane exclusion (ignore completely)
+    if (isDesignatedLane(loadContext, rules)) {
+      const lane = laneFromContext(loadContext) || "(unknown)";
+      await logEvent("designated_lane_ignored", { endpoint: "draft_carrier_reply", lane });
+      return json(res, 200, {
+        ok: true,
+        ignored: true,
+        reason: "designated_lane",
+        lane,
+        result: {
+          lane_guess: lane,
+          mc_found: null,
+          mc_value: null,
+          needs_mc_request: false,
+          draft_reply_text: "",
+          negotiation_next_line: "",
+          notes_for_owner: "Designated lane: ignored by AI."
+        }
+      });
+    }
+
+    const loadLane = laneFromContext(loadContext) || null;
     const haveAll = hasAllLoadDetails(loadContext);
 
     const system = `
@@ -358,10 +522,9 @@ Hard requirements:
   3) Truckload of {commodity_desc} weighing {weight_lbs}lbs
 - Ask for MC ONLY if not found.
 - If load_context has details, DO NOT ask to confirm them.
-- Keep tone polite, short.
-
-Return ONLY JSON with:
-lane_guess, mc_found, mc_value, needs_mc_request, draft_reply_text, negotiation_next_line, notes_for_owner
+- No fluff. No "thanks". Short and firm.
+- Return ONLY JSON with:
+  lane_guess, mc_found, mc_value, needs_mc_request, draft_reply_text, negotiation_next_line, notes_for_owner
 `;
 
     const user = `
@@ -378,18 +541,19 @@ ${JSON.stringify(loadContext)}
     const result = await openaiChatJSON({ system, user, maxTokens: 900 });
 
     await logEvent("draft_carrier_reply", {
-      lane_guess: result?.lane_guess,
+      lane_guess: result?.lane_guess || loadLane,
       mc_found: result?.mc_found,
       used_load_context: haveAll
     });
 
+    // Alert if MC missing
     try {
       if (result?.needs_mc_request) {
         await createAlert({
           severity: "info",
           title: "MC needed",
-          message: `Carrier asked about lane ${result?.lane_guess || "(unknown)"} but did not provide MC.`,
-          meta: { lane: result?.lane_guess || null }
+          message: `Carrier asked about lane ${result?.lane_guess || loadLane || "(unknown)"} but did not provide MC.`,
+          meta: { lane: result?.lane_guess || loadLane || null }
         });
       }
     } catch {}
@@ -398,19 +562,40 @@ ${JSON.stringify(loadContext)}
   }
 
   // Draft negotiation (deterministic, firm, short)
-  if (req.url === "/draft/negotiate" && req.method === "POST") {
+  if (pathname === "/draft/negotiate" && req.method === "POST") {
+    const rules = (await getConfig("rules")) || {};
+
     const bodyText = await readBody(req);
-    let body;
-    try {
-      body = JSON.parse(bodyText || "{}");
-    } catch {
+    const parsed = safeJsonParse(bodyText);
+    if (!parsed.ok) {
       await logEvent("draft_negotiate_error", { reason: "invalid_json" });
       return json(res, 400, { error: "Invalid JSON body" });
     }
+    const body = parsed.value;
 
     const emailText = (body.email_text || "").toString().slice(0, 12000);
     const loadContext = normalizeLoadContext(body.load_context || {});
-    const lane = loadContext.lane_guess || null;
+    const lane = laneFromContext(loadContext) || null;
+
+    // Phase 2: designated lane exclusion (ignore completely)
+    if (isDesignatedLane(loadContext, rules)) {
+      await logEvent("designated_lane_ignored", { endpoint: "draft_negotiate", lane: lane || "(unknown)" });
+      return json(res, 200, {
+        ok: true,
+        ignored: true,
+        reason: "designated_lane",
+        lane,
+        result: {
+          decision: "ignore",
+          counter_rate: null,
+          midpoint_rate: null,
+          max_rate_without_owner: null,
+          draft_reply_text: "",
+          reasoning: "Designated lane: AI must ignore completely.",
+          owner_alert: null
+        }
+      });
+    }
 
     const negotiationRound = Math.max(1, Number(body.negotiation_round || 1));
     const lastCounter = numOrNull(body.last_counter_rate);
@@ -431,7 +616,12 @@ ${JSON.stringify(loadContext)}
       return json(res, 400, { error: "Missing/invalid load_context.posted_rate" });
     }
     if (mid == null || mid <= 0) {
-      await logEvent("draft_negotiate_error", { reason: "missing_midpoint", low, high, midpoint_rate: loadContext.midpoint_rate });
+      await logEvent("draft_negotiate_error", {
+        reason: "missing_midpoint",
+        low,
+        high,
+        midpoint_rate: loadContext.midpoint_rate
+      });
       return json(res, 400, { error: "Missing/invalid midpoint. Provide midpoint_rate OR rateview_low & rateview_high." });
     }
 
@@ -450,7 +640,7 @@ ${JSON.stringify(loadContext)}
       return json(res, 200, { ok: true, result });
     }
 
-    // Flag if carrier ask is within $100 of midpoint (your instruction)
+    // Alert if within $100 of midpoint
     if (Math.abs(carrierAsk - mid) <= 100) {
       try {
         await createAlert({
@@ -485,23 +675,23 @@ ${JSON.stringify(loadContext)}
       return json(res, 200, { ok: true, result });
     }
 
-    // Round behavior you requested:
-    // Round 1 = first counter (e.g., 685)
-    // Round 2 = snap to next 25-grid above (first+25 => 725 style)
-    // Round 3+ = MIDPOINT (final)
+    // Round behavior:
+    // Round 1 = first counter
+    // Round 2 = snap to next 25-grid above
+    // Round 3+ = MIDPOINT
     const firstCounter = computeFirstCounter({ postedRate, carrierAsk, mid });
 
     let counter = firstCounter;
 
     if (negotiationRound === 2) {
       const base = lastCounter != null ? lastCounter : firstCounter;
-      counter = ceilTo25(base + 25); // 685 -> 710 -> 725
+      counter = ceilTo25(base + 25);
       counter = Math.min(counter, mid);
       counter = roundTo5(counter);
     }
 
     if (negotiationRound >= 3) {
-      counter = mid; // your instruction: round 3 = midpoint
+      counter = mid;
     }
 
     // Decision
@@ -547,8 +737,58 @@ ${JSON.stringify(loadContext)}
     return json(res, 200, { ok: true, result });
   }
 
+  // Phase 3 prep: draft-only load matching
+  if (pathname === "/draft/match-load" && req.method === "POST") {
+    const bodyText = await readBody(req);
+    const parsed = safeJsonParse(bodyText);
+    if (!parsed.ok) {
+      await logEvent("draft_match_error", { reason: "invalid_json" });
+      return json(res, 400, { error: "Invalid JSON body" });
+    }
+    const body = parsed.value;
+
+    const emailText = (body.email_text || "").toString().slice(0, 12000);
+    const candidateLoads = Array.isArray(body.candidate_loads) ? body.candidate_loads : [];
+
+    if (!emailText) return json(res, 400, { error: "Missing email_text" });
+    if (candidateLoads.length === 0) return json(res, 400, { error: "Missing candidate_loads (array)" });
+
+    const hints = extractCityStateHints(emailText);
+
+    const scored = candidateLoads
+      .map(l => {
+        const load = {
+          id: l.id ?? null,
+          pickup_city_state: l.pickup_city_state ?? "",
+          delivery_city_state: l.delivery_city_state ?? "",
+          weight_lbs: l.weight_lbs ?? null,
+          ref: l
+        };
+        const score = scoreLoadMatch(
+          { pickupHint: hints.pickup_hint, deliveryHint: hints.delivery_hint, weightHint: hints.weight_hint },
+          load
+        );
+        return { id: load.id, score, pickup_city_state: load.pickup_city_state, delivery_city_state: load.delivery_city_state, weight_lbs: load.weight_lbs, load: load.ref };
+      })
+      .sort((a, b) => b.score - a.score);
+
+    const best = scored[0] || null;
+
+    await logEvent("draft_match_load", {
+      candidates: candidateLoads.length,
+      best_score: best?.score ?? null
+    });
+
+    return json(res, 200, {
+      ok: true,
+      hints,
+      best_match: best,
+      top_matches: scored.slice(0, 5)
+    });
+  }
+
   await logEvent("unknown_route", { path: req.url, method: req.method });
-  return json(res, 200, { status: "DKT AI server running (secured)" });
+  return json(res, 404, { error: "Not found" });
 });
 
 server.listen(10000, () => console.log("Server running (port 10000)"));
