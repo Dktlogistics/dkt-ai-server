@@ -6,12 +6,10 @@ const { Pool } = require("pg");
 // --------------------
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  // Render Postgres commonly needs SSL; safe for hosted DBs
   ssl: process.env.DATABASE_URL ? { rejectUnauthorized: false } : undefined
 });
 
 async function ensureTables() {
-  // Audit log table
   await pool.query(`
     CREATE TABLE IF NOT EXISTS audit_log (
       id BIGSERIAL PRIMARY KEY,
@@ -21,7 +19,6 @@ async function ensureTables() {
     );
   `);
 
-  // Rules/config storage
   await pool.query(`
     CREATE TABLE IF NOT EXISTS app_config (
       key TEXT PRIMARY KEY,
@@ -30,7 +27,6 @@ async function ensureTables() {
     );
   `);
 
-  // Owner alert feed (for you to review)
   await pool.query(`
     CREATE TABLE IF NOT EXISTS owner_alerts (
       id BIGSERIAL PRIMARY KEY,
@@ -50,7 +46,6 @@ async function logEvent(eventType, details = {}) {
       [eventType, JSON.stringify(details)]
     );
   } catch (e) {
-    // Never crash the server if logging fails
     console.error("Audit log insert failed:", e?.message || e);
   }
 }
@@ -159,13 +154,12 @@ async function openaiChatJSON({ system, user, maxTokens = 900 }) {
 }
 
 // --------------------
-// Draft logic helpers
+// Draft helpers
 // --------------------
 function isNonEmptyString(x) {
   return typeof x === "string" && x.trim().length > 0;
 }
 
-// Allowlist load_context keys (guardrail)
 function normalizeLoadContext(ctx = {}) {
   const safe = {
     pickup_fcfs_or_appt: ctx.pickup_fcfs_or_appt ?? null,
@@ -179,7 +173,8 @@ function normalizeLoadContext(ctx = {}) {
     posted_rate: ctx.posted_rate ?? null,
     midpoint_rate: ctx.midpoint_rate ?? null,
     rateview_low: ctx.rateview_low ?? null,
-    rateview_high: ctx.rateview_high ?? null
+    rateview_high: ctx.rateview_high ?? null,
+    lane_guess: ctx.lane_guess ?? null
   };
 
   for (const k of Object.keys(safe)) {
@@ -200,6 +195,18 @@ function hasAllLoadDetails(loadContext) {
       isNonEmptyString(String(loadContext.weight_lbs || ""))) &&
     isNonEmptyString(loadContext.commodity_desc)
   );
+}
+
+function numOrNull(x) {
+  const n = Number(x);
+  return Number.isFinite(n) ? n : null;
+}
+
+function midpoint(low, high) {
+  const l = numOrNull(low);
+  const h = numOrNull(high);
+  if (l == null || h == null) return null;
+  return Math.round((l + h) / 2);
 }
 
 // --------------------
@@ -256,7 +263,7 @@ const server = http.createServer(async (req, res) => {
     return json(res, 200, { rules });
   }
 
-  // Owner alerts (create)
+  // Owner alerts
   if (req.url === "/alerts" && req.method === "POST") {
     const bodyText = await readBody(req);
     let body;
@@ -280,7 +287,6 @@ const server = http.createServer(async (req, res) => {
     return json(res, 200, { ok: true });
   }
 
-  // Owner alerts (list)
   if (req.url.startsWith("/alerts") && req.method === "GET") {
     const url = new URL(req.url, "https://dummy.local");
     const limit = url.searchParams.get("limit") || "25";
@@ -289,7 +295,7 @@ const server = http.createServer(async (req, res) => {
     return json(res, 200, { ok: true, alerts });
   }
 
-  // Draft carrier reply (Phase 1, draft-only)
+  // Draft carrier reply (Phase 1)
   if (req.url === "/draft/carrier-reply" && req.method === "POST") {
     const rules = (await getConfig("rules")) || {};
     const safetyMode = rules?.safety?.mode || "draft_only";
@@ -345,7 +351,7 @@ LOAD_CONTEXT (may be empty; if present, trust it):
 ${JSON.stringify(loadContext)}
 
 TASK:
-1) Guess lane from email if present (e.g., "Seymour IN to Cookeville TN").
+1) Guess lane from email if present.
 2) Detect MC/DOT in the email if present. If none found, set mc_found=false and needs_mc_request=true.
 3) Draft reply using the 3-line required format. Use LOAD_CONTEXT values if provided.
 4) If LOAD_CONTEXT is missing key details, ask ONE short clarifying question:
@@ -363,7 +369,7 @@ Return ONLY JSON.
       used_load_context: haveAll
     });
 
-    // Auto-alerts (draft-only)
+    // Auto-alerts
     try {
       if (result?.needs_mc_request) {
         await createAlert({
@@ -373,20 +379,96 @@ Return ONLY JSON.
           meta: { lane: result?.lane_guess || null }
         });
       }
-      // If carrier appears ready to book / "lets do it" (best-effort heuristic)
-      const lower = emailText.toLowerCase();
-      if (lower.includes("let's do it") || lower.includes("lets do it") || lower.includes("book it") || lower.includes("we can do it")) {
+    } catch {}
+
+    return json(res, 200, { ok: true, result });
+  }
+
+  // NEW: Draft negotiation response (Phase 1, draft-only)
+  if (req.url === "/draft/negotiate" && req.method === "POST") {
+    const rules = (await getConfig("rules")) || {};
+    const safetyMode = rules?.safety?.mode || "draft_only";
+
+    const bodyText = await readBody(req);
+    let body;
+    try {
+      body = JSON.parse(bodyText || "{}");
+    } catch {
+      await logEvent("draft_negotiate_error", { reason: "invalid_json" });
+      return json(res, 400, { error: "Invalid JSON body" });
+    }
+
+    const emailText = (body.email_text || "").toString().slice(0, 12000);
+    const loadContext = normalizeLoadContext(body.load_context || {});
+    const carrierAsk = numOrNull(body.carrier_ask_rate);
+    const postedRate = numOrNull(loadContext.posted_rate);
+    const low = numOrNull(loadContext.rateview_low);
+    const high = numOrNull(loadContext.rateview_high);
+    const mid = numOrNull(loadContext.midpoint_rate) ?? midpoint(low, high);
+
+    // Guardrail: if we don't have at least posted rate OR midpoint, we can still draft, but we should flag.
+    const system = `
+You are DKT Logistics' carrier negotiation assistant.
+SAFETY MODE: ${safetyMode}. Draft-only.
+
+You MUST follow these guardrails:
+- Never recommend paying above the RateView HIGH unless owner approves.
+- Prefer booking below MIDPOINT when possible; MIDPOINT is acceptable.
+- If carrier ask is far above posted rate, counter up but stay under midpoint if possible.
+- Keep tone polite and personal. You may use a light-load/fuel-angle if weight under 25000 lbs.
+
+Return ONLY valid JSON with:
+- decision (accept|counter|escalate)
+- counter_rate (number|null)
+- max_rate_without_owner (number|null)   // typically = high
+- draft_reply_text (string)             // what to send the carrier (draft)
+- reasoning (string)                    // short explanation for owner
+- owner_alert (object|null)             // if escalate, include {severity,title,message,meta}
+`;
+
+    const user = `
+RULES JSON:
+${JSON.stringify(rules)}
+
+CONTEXT:
+lane: ${loadContext.lane_guess || "(unknown)"}
+weight_lbs: ${loadContext.weight_lbs ?? "(unknown)"}
+posted_rate: ${postedRate ?? "(unknown)"}
+rateview_low: ${low ?? "(unknown)"}
+rateview_high: ${high ?? "(unknown)"}
+midpoint_rate: ${mid ?? "(unknown)"}
+carrier_ask_rate: ${carrierAsk ?? "(unknown)"}
+
+CARRIER MESSAGE / EMAIL:
+${emailText}
+
+TASK:
+- If carrier_ask_rate is not provided, infer it if the carrier states a rate in text; otherwise ask "What rate are you looking for?"
+- Produce a decision and a single best draft reply.
+- Enforce: never above HIGH without owner. If carrier asks above HIGH, decision must be escalate.
+`;
+
+    const result = await openaiChatJSON({ system, user, maxTokens: 900 });
+
+    await logEvent("draft_negotiate", {
+      lane: loadContext.lane_guess || null,
+      postedRate,
+      mid,
+      high,
+      carrierAsk
+    });
+
+    // If model suggests escalation, create an owner alert
+    try {
+      if (result?.owner_alert && result?.owner_alert?.title) {
         await createAlert({
-          severity: "high",
-          title: "Carrier ready to book",
-          message: `Carrier seems ready to book for lane ${result?.lane_guess || "(unknown)"} — review and proceed.`,
-          meta: { lane: result?.lane_guess || null }
+          severity: result.owner_alert.severity || "high",
+          title: result.owner_alert.title,
+          message: result.owner_alert.message || "Negotiation requires owner review.",
+          meta: result.owner_alert.meta || {}
         });
       }
-    } catch (e) {
-      // Alerts should never break the request
-      console.error("Alert creation failed:", e?.message || e);
-    }
+    } catch {}
 
     return json(res, 200, { ok: true, result });
   }
