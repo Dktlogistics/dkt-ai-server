@@ -5,6 +5,11 @@ function unauthorized(res) {
   res.end("Unauthorized");
 }
 
+function ok(res, text) {
+  res.writeHead(200, { "Content-Type": "text/plain" });
+  res.end(text);
+}
+
 const server = http.createServer((req, res) => {
   const token = req.headers["authorization"];
   const expected = process.env.AUTH_TOKEN;
@@ -14,12 +19,15 @@ const server = http.createServer((req, res) => {
     return res.end("Server misconfigured");
   }
 
-  if (!token || token !== `Bearer ${expected}`) {
-    return unauthorized(res);
+  // Allow an easy health check endpoint (still secured)
+  if (req.url === "/health") {
+    if (!token || token !== `Bearer ${expected}`) return unauthorized(res);
+    return ok(res, "OK");
   }
 
-  res.writeHead(200, { "Content-Type": "text/plain" });
-  res.end("DKT AI server is running (secured)");
+  // Default route (still secured)
+  if (!token || token !== `Bearer ${expected}`) return unauthorized(res);
+  return ok(res, "DKT AI server is running (secured)");
 });
 
 server.listen(10000, () => {
