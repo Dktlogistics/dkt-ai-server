@@ -113,7 +113,7 @@ function readBody(req) {
 }
 
 // --------------------
-// OpenAI helper (JSON only) - still used for draft carrier-reply
+// OpenAI helper (JSON only) - used for /draft/carrier-reply
 // --------------------
 async function openaiChatJSON({ system, user, maxTokens = 900 }) {
   const apiKey = process.env.OPENAI_API_KEY;
@@ -177,6 +177,8 @@ function midpointFromLowHigh(low, high) {
   const l = numOrNull(low);
   const h = numOrNull(high);
   if (l == null || h == null) return null;
+  // if low/high accidentally come in as 0/0, treat as invalid
+  if (l <= 0 || h <= 0) return null;
   return Math.round((l + h) / 2);
 }
 
@@ -200,12 +202,14 @@ function normalizeLoadContext(ctx = {}) {
     delivery_city_state: ctx.delivery_city_state ?? null,
     weight_lbs: ctx.weight_lbs ?? null,
     commodity_desc: ctx.commodity_desc ?? null,
+
     posted_rate: ctx.posted_rate ?? null,
     midpoint_rate: ctx.midpoint_rate ?? null,
     rateview_low: ctx.rateview_low ?? null,
     rateview_high: ctx.rateview_high ?? null,
     lane_guess: ctx.lane_guess ?? null
   };
+
   for (const k of Object.keys(safe)) {
     if (typeof safe[k] === "string") safe[k] = safe[k].trim();
   }
@@ -231,15 +235,19 @@ function formatPrice(rate) {
 }
 
 function computeFirstCounter({ postedRate, carrierAsk, mid }) {
+  // posted + 35% of gap, bump clamped 60..120, rounded to 5, never above midpoint
   const gap = carrierAsk - postedRate;
   let bump = gap * 0.35;
   bump = Math.max(60, Math.min(120, bump));
   let counter = postedRate + bump;
   counter = roundTo5(counter);
-  if (mid != null) counter = Math.min(counter, mid);
+  counter = Math.min(counter, mid);
   return Math.round(counter);
 }
 
+// --------------------
+// Server
+// --------------------
 let tablesReady = false;
 
 const server = http.createServer(async (req, res) => {
@@ -341,8 +349,7 @@ const server = http.createServer(async (req, res) => {
 
     const system = `
 You are DKT Logistics' carrier email assistant.
-You MUST follow the rules provided.
-You are in SAFETY MODE: ${safetyMode}. Draft only.
+SAFETY MODE: ${safetyMode}. Draft only.
 
 Hard requirements:
 - Format EXACTLY:
@@ -411,34 +418,52 @@ ${JSON.stringify(loadContext)}
     const postedRate = numOrNull(loadContext.posted_rate);
     const low = numOrNull(loadContext.rateview_low);
     const high = numOrNull(loadContext.rateview_high);
-    const mid = numOrNull(loadContext.midpoint_rate) ?? midpointFromLowHigh(low, high);
+    const mid =
+      numOrNull(loadContext.midpoint_rate) ??
+      midpointFromLowHigh(low, high);
 
     let carrierAsk = numOrNull(body.carrier_ask_rate);
     if (carrierAsk == null) carrierAsk = parseRateFromText(emailText);
 
-    if (postedRate == null) {
+    // Required inputs (prevents midpoint=0 bugs)
+    if (postedRate == null || postedRate <= 0) {
       await logEvent("draft_negotiate_error", { reason: "missing_posted_rate" });
-      return json(res, 400, { error: "Missing load_context.posted_rate" });
+      return json(res, 400, { error: "Missing/invalid load_context.posted_rate" });
     }
-    if (mid == null) {
-      await logEvent("draft_negotiate_error", { reason: "missing_midpoint" });
-      return json(res, 400, { error: "Missing midpoint (provide midpoint_rate or rateview_low/high)" });
+    if (mid == null || mid <= 0) {
+      await logEvent("draft_negotiate_error", { reason: "missing_midpoint", low, high, midpoint_rate: loadContext.midpoint_rate });
+      return json(res, 400, { error: "Missing/invalid midpoint. Provide midpoint_rate OR rateview_low & rateview_high." });
     }
 
-    // Flag if carrier is within $100 of midpoint
-    if (carrierAsk != null && Math.abs(carrierAsk - mid) <= 100) {
+    // If no ask found, ask for it (short)
+    if (carrierAsk == null) {
+      const result = {
+        decision: "counter",
+        counter_rate: null,
+        midpoint_rate: mid,
+        max_rate_without_owner: high ?? null,
+        draft_reply_text: "What rate are you looking for?",
+        reasoning: "Carrier ask rate not provided/found. Request it.",
+        owner_alert: null
+      };
+      await logEvent("draft_negotiate", { lane, postedRate, mid, high, carrierAsk: null, decision: "ask_rate" });
+      return json(res, 200, { ok: true, result });
+    }
+
+    // Flag if carrier ask is within $100 of midpoint (your instruction)
+    if (Math.abs(carrierAsk - mid) <= 100) {
       try {
         await createAlert({
           severity: "high",
           title: "Carrier offer near midpoint",
-          message: `Carrier asked $${carrierAsk} for ${lane || "lane"} (midpoint ~$${mid}). Recommend owner review/accept.`,
+          message: `Carrier asked $${carrierAsk} for ${lane || "lane"} (midpoint ~$${mid}). Owner should review/accept.`,
           meta: { lane, carrierAsk, midpoint: mid, postedRate }
         });
       } catch {}
     }
 
     // Above high => escalate
-    if (carrierAsk != null && high != null && carrierAsk > high) {
+    if (high != null && high > 0 && carrierAsk > high) {
       const result = {
         decision: "escalate",
         counter_rate: null,
@@ -460,44 +485,23 @@ ${JSON.stringify(loadContext)}
       return json(res, 200, { ok: true, result });
     }
 
-    // If no ask found, ask for it (short)
-    if (carrierAsk == null) {
-      const result = {
-        decision: "counter",
-        counter_rate: null,
-        midpoint_rate: mid,
-        max_rate_without_owner: high ?? null,
-        draft_reply_text: "What rate are you looking for?",
-        reasoning: "Carrier ask rate not provided/found. Request it.",
-        owner_alert: null
-      };
-      await logEvent("draft_negotiate", { lane, postedRate, mid, high, carrierAsk: null, decision: "ask_rate" });
-      return json(res, 200, { ok: true, result });
-    }
-
-    // Round 1: compute first counter (e.g., 685)
+    // Round behavior you requested:
+    // Round 1 = first counter (e.g., 685)
+    // Round 2 = snap to next 25-grid above (first+25 => 725 style)
+    // Round 3+ = MIDPOINT (final)
     const firstCounter = computeFirstCounter({ postedRate, carrierAsk, mid });
 
-    // Round 2: snap to next 25-grid ABOVE (firstCounter + 25) => 685 -> 725
-    // Round 3+: +25 steps from last counter
     let counter = firstCounter;
 
-    if (negotiationRound >= 2) {
+    if (negotiationRound === 2) {
       const base = lastCounter != null ? lastCounter : firstCounter;
-
-      if (negotiationRound === 2) {
-        counter = ceilTo25(base + 25);
-      } else {
-        counter = base + 25 * (negotiationRound - 1);
-      }
-
+      counter = ceilTo25(base + 25); // 685 -> 710 -> 725
       counter = Math.min(counter, mid);
       counter = roundTo5(counter);
     }
 
-    // Final round: go to midpoint (default round 4+)
-    if (negotiationRound >= 4) {
-      counter = mid;
+    if (negotiationRound >= 3) {
+      counter = mid; // your instruction: round 3 = midpoint
     }
 
     // Decision
@@ -510,17 +514,17 @@ ${JSON.stringify(loadContext)}
       midpoint_rate: mid,
       max_rate_without_owner: high ?? null,
       draft_reply_text: formatPrice(counter),
-      reasoning: `Posted $${postedRate}, carrier asked $${carrierAsk}, midpoint ~$${mid}. Round ${negotiationRound} counter set to $${counter}.`,
+      reasoning: `Posted $${postedRate}, carrier asked $${carrierAsk}, midpoint $${mid}. Round ${negotiationRound} => $${counter}.`,
       owner_alert: null
     };
 
-    // If we reached midpoint and still not accepted, flag owner
+    // If at midpoint and carrier still above, flag owner
     if (counter === mid && carrierAsk > mid) {
       result.decision = "escalate";
       result.owner_alert = {
         severity: "high",
         title: "Negotiation at midpoint",
-        message: `Negotiation reached midpoint $${mid} for ${lane || "lane"} and carrier still higher ($${carrierAsk}). Owner decision needed.`,
+        message: `At midpoint $${mid} for ${lane || "lane"} but carrier still at $${carrierAsk}. Owner decision needed.`,
         meta: { lane, postedRate, midpoint: mid, carrierAsk }
       };
       try {
@@ -547,4 +551,4 @@ ${JSON.stringify(loadContext)}
   return json(res, 200, { status: "DKT AI server running (secured)" });
 });
 
-server.listen(10000, () => console.log("Server running on port 10000"));
+server.listen(10000, () => console.log("Server running (port 10000)"));
