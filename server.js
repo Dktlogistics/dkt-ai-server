@@ -184,7 +184,6 @@ function isNonEmptyString(x) {
  */
 function numOrNull(x) {
   if (x === null || x === undefined) return null;
-
   if (typeof x === "number") return Number.isFinite(x) ? x : null;
 
   const s = String(x).trim().replace(/[$,]/g, "");
@@ -196,10 +195,6 @@ function numOrNull(x) {
 
 function roundTo5(n) {
   return Math.round(n / 5) * 5;
-}
-
-function ceilTo25(n) {
-  return Math.ceil(n / 25) * 25;
 }
 
 function midpointFromLowHigh(low, high) {
@@ -219,7 +214,12 @@ function parseRateFromText(text) {
   return null;
 }
 
-// Allowlist load_context keys (guardrail)
+function looksLikeRateRequest(emailText) {
+  const t = String(emailText || "").toLowerCase();
+  // Simple heuristic for "rate?" messages
+  return /\brate\??\b/.test(t) || /\bwhat.*rate\b/.test(t) || /\bprice\??\b/.test(t);
+}
+
 function normalizeLoadContext(ctx = {}) {
   const safe = {
     pickup_fcfs_or_appt: ctx.pickup_fcfs_or_appt ?? null,
@@ -244,32 +244,21 @@ function normalizeLoadContext(ctx = {}) {
   return safe;
 }
 
-function hasAllLoadDetails(loadContext) {
-  return (
-    isNonEmptyString(loadContext.pickup_fcfs_or_appt) &&
-    isNonEmptyString(loadContext.pickup_time_window_military) &&
-    isNonEmptyString(loadContext.pickup_city_state) &&
-    isNonEmptyString(loadContext.delivery_fcfs_or_appt) &&
-    isNonEmptyString(loadContext.delivery_time_window_military) &&
-    isNonEmptyString(loadContext.delivery_city_state) &&
-    (typeof loadContext.weight_lbs === "number" ||
-      isNonEmptyString(String(loadContext.weight_lbs || ""))) &&
-    isNonEmptyString(loadContext.commodity_desc)
-  );
-}
-
-function formatPrice(rate) {
+function formatCounter(rate) {
   return `We’re at $${rate}.`;
 }
 
-function computeFirstCounter({ postedRate, carrierAsk, mid }) {
-  // posted + 35% of gap, bump clamped 60..120, rounded to 5, never above midpoint
+function formatLock(rate) {
+  return `Let’s do it at $${rate}.`;
+}
+
+function computeFirstCounter({ postedRate, carrierAsk }) {
+  // posted + 35% of gap, bump clamped 60..120, rounded to 5
   const gap = carrierAsk - postedRate;
   let bump = gap * 0.35;
   bump = Math.max(60, Math.min(120, bump));
   let counter = postedRate + bump;
   counter = roundTo5(counter);
-  counter = Math.min(counter, mid);
   return Math.round(counter);
 }
 
@@ -296,7 +285,6 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
-  // Parse URL safely
   const urlObj = new URL(req.url, "https://dummy.local");
   const pathname = urlObj.pathname;
 
@@ -355,7 +343,7 @@ const server = http.createServer(async (req, res) => {
     return json(res, 200, { ok: true, alerts });
   }
 
-  // Draft carrier reply (Phase 1)
+  // Draft carrier reply (kept as-is from your design; OpenAI JSON)
   if (pathname === "/draft/carrier-reply" && req.method === "POST") {
     const rules = (await getConfig("rules")) || {};
     const safetyMode = rules?.safety?.mode || "draft_only";
@@ -372,7 +360,6 @@ const server = http.createServer(async (req, res) => {
     if (!emailText) return json(res, 400, { error: "Missing email_text" });
 
     const loadContext = normalizeLoadContext(body.load_context || {});
-    const haveAll = hasAllLoadDetails(loadContext);
 
     const system = `
 You are DKT Logistics' carrier email assistant.
@@ -406,8 +393,7 @@ ${JSON.stringify(loadContext)}
 
     await logEvent("draft_carrier_reply", {
       lane_guess: result?.lane_guess,
-      mc_found: result?.mc_found,
-      used_load_context: haveAll
+      mc_found: result?.mc_found
     });
 
     try {
@@ -424,7 +410,7 @@ ${JSON.stringify(loadContext)}
     return json(res, 200, { ok: true, result });
   }
 
-  // Draft negotiation (deterministic, firm, short)
+  // ✅ UPDATED: Draft negotiation (your exact flow)
   if (pathname === "/draft/negotiate" && req.method === "POST") {
     const bodyText = await readBody(req);
     const parsed = safeJsonParse(bodyText);
@@ -436,10 +422,8 @@ ${JSON.stringify(loadContext)}
     const body = parsed.value;
     const emailText = (body.email_text || "").toString().slice(0, 12000);
 
-    // Load context
+    // Load context + fallback if user sent fields at top level by mistake
     const loadContext = normalizeLoadContext(body.load_context || {});
-
-    // IMPORTANT FIX: fallback if user accidentally sends fields outside load_context
     if (loadContext.posted_rate == null && body.posted_rate != null) loadContext.posted_rate = body.posted_rate;
     if (loadContext.midpoint_rate == null && body.midpoint_rate != null) loadContext.midpoint_rate = body.midpoint_rate;
     if (loadContext.rateview_low == null && body.rateview_low != null) loadContext.rateview_low = body.rateview_low;
@@ -447,39 +431,59 @@ ${JSON.stringify(loadContext)}
 
     const lane = loadContext.lane_guess || null;
 
-    const negotiationRound = Math.max(1, Number(body.negotiation_round || 1));
-    const lastCounter = numOrNull(body.last_counter_rate);
-
+    // Parse rates
     const postedRate = numOrNull(loadContext.posted_rate);
     const low = numOrNull(loadContext.rateview_low);
     const high = numOrNull(loadContext.rateview_high);
     const mid = numOrNull(loadContext.midpoint_rate) ?? midpointFromLowHigh(low, high);
 
+    // Carrier ask can come from explicit field or extracted from email text
     let carrierAsk = numOrNull(body.carrier_ask_rate);
     if (carrierAsk == null) carrierAsk = parseRateFromText(emailText);
 
-    // Required inputs
+    // Optional flags from your workflow
+    const noResponseAfterMidpoint = body.no_response_after_midpoint === true;
+
+    // Must have posted and midpoint
     if (postedRate == null || postedRate <= 0) {
       await logEvent("draft_negotiate_error", { reason: "missing_posted_rate" });
       return json(res, 400, { error: "Missing/invalid load_context.posted_rate" });
     }
     if (mid == null || mid <= 0) {
-      await logEvent("draft_negotiate_error", {
-        reason: "missing_midpoint",
-        low,
-        high,
-        midpoint_rate: loadContext.midpoint_rate
-      });
+      await logEvent("draft_negotiate_error", { reason: "missing_midpoint", low, high, midpoint_rate: loadContext.midpoint_rate });
       return json(res, 400, {
         error: "Missing/invalid midpoint. Provide midpoint_rate OR rateview_low & rateview_high.",
         debug: { received_low: loadContext.rateview_low, received_high: loadContext.rateview_high, received_midpoint_rate: loadContext.midpoint_rate }
       });
     }
 
-    // If no ask found, ask for it
+    // ----------------------------
+    // FLOW STEP 1:
+    // Carrier first reaches out and asks rate (no number provided)
+    // -> respond around RateView LOW (or fallback posted)
+    // ----------------------------
+    if (carrierAsk == null && looksLikeRateRequest(emailText)) {
+      const initial = (low != null && low > 0) ? low : postedRate;
+
+      const result = {
+        decision: "quote_low",
+        quote_rate: initial,
+        counter_rate: initial,
+        midpoint_rate: mid,
+        max_rate_without_owner: high ?? null,
+        draft_reply_text: formatCounter(initial),
+        reasoning: `Carrier asked for rate. Quote RateView low ($${initial}).`,
+        owner_alert: null
+      };
+
+      await logEvent("draft_negotiate", { lane, step: "initial_quote", postedRate, low, high, mid, quote: initial });
+      return json(res, 200, { ok: true, result });
+    }
+
+    // If still no ask and it wasn't clearly a rate request, ask for rate
     if (carrierAsk == null) {
       const result = {
-        decision: "counter",
+        decision: "ask_rate",
         counter_rate: null,
         midpoint_rate: mid,
         max_rate_without_owner: high ?? null,
@@ -487,24 +491,20 @@ ${JSON.stringify(loadContext)}
         reasoning: "Carrier ask rate not provided/found. Request it.",
         owner_alert: null
       };
-      await logEvent("draft_negotiate", { lane, postedRate, mid, high, carrierAsk: null, decision: "ask_rate" });
+      await logEvent("draft_negotiate", { lane, step: "ask_rate", postedRate, low, high, mid });
       return json(res, 200, { ok: true, result });
     }
 
-    // Alert if within $100 of midpoint
-    if (Math.abs(carrierAsk - mid) <= 100) {
-      try {
-        await createAlert({
-          severity: "high",
-          title: "Carrier offer near midpoint",
-          message: `Carrier asked $${carrierAsk} for ${lane || "lane"} (midpoint ~$${mid}). Owner should review/accept.`,
-          meta: { lane, carrierAsk, midpoint: mid, postedRate }
-        });
-      } catch {}
-    }
-
-    // Above high => escalate
+    // Alert if above RateView high
     if (high != null && high > 0 && carrierAsk > high) {
+      const owner_alert = {
+        severity: "high",
+        title: "Carrier ask above high",
+        message: `Carrier asked $${carrierAsk} (above high $${high}) for ${lane || "lane"}.`,
+        meta: { lane, carrierAsk, high, postedRate, midpoint: mid }
+      };
+      try { await createAlert(owner_alert); } catch {}
+
       const result = {
         decision: "escalate",
         counter_rate: null,
@@ -512,77 +512,102 @@ ${JSON.stringify(loadContext)}
         max_rate_without_owner: high,
         draft_reply_text: "",
         reasoning: `Carrier ask $${carrierAsk} is above RateView high $${high}. Owner should handle.`,
-        owner_alert: {
-          severity: "high",
-          title: "Carrier ask above high",
-          message: `Carrier asked $${carrierAsk} (above high $${high}) for ${lane || "lane"}.`,
-          meta: { lane, carrierAsk, high, postedRate, midpoint: mid }
-        }
+        owner_alert
       };
-      try {
-        await createAlert(result.owner_alert);
-      } catch {}
-      await logEvent("draft_negotiate", { lane, postedRate, mid, high, carrierAsk, decision: "escalate" });
+
+      await logEvent("draft_negotiate", { lane, step: "above_high", postedRate, low, high, mid, carrierAsk });
       return json(res, 200, { ok: true, result });
     }
 
-    // Round behavior:
-    const firstCounter = computeFirstCounter({ postedRate, carrierAsk, mid });
-
-    let counter = firstCounter;
-
-    if (negotiationRound === 2) {
-      const base = lastCounter != null ? lastCounter : firstCounter;
-      counter = ceilTo25(base + 25); // 685 -> 725 style
-      counter = Math.min(counter, mid);
-      counter = roundTo5(counter);
-    }
-
-    if (negotiationRound >= 3) {
-      counter = mid;
-    }
-
-    // Decision
-    let decision = "counter";
-    if (carrierAsk <= counter) decision = "accept";
-
-    const result = {
-      decision,
-      counter_rate: counter,
-      midpoint_rate: mid,
-      max_rate_without_owner: high ?? null,
-      draft_reply_text: formatPrice(counter),
-      reasoning: `Posted $${postedRate}, carrier asked $${carrierAsk}, midpoint $${mid}. Round ${negotiationRound} => $${counter}.`,
-      owner_alert: null
-    };
-
-    // If at midpoint and carrier still above, flag owner
-    if (counter === mid && carrierAsk > mid) {
-      result.decision = "escalate";
-      result.owner_alert = {
-        severity: "high",
-        title: "Negotiation at midpoint",
-        message: `At midpoint $${mid} for ${lane || "lane"} but carrier still at $${carrierAsk}. Owner decision needed.`,
-        meta: { lane, postedRate, midpoint: mid, carrierAsk }
-      };
+    // Alert if within $100 of midpoint (your rule)
+    if (Math.abs(carrierAsk - mid) <= 100) {
       try {
-        await createAlert(result.owner_alert);
+        await createAlert({
+          severity: "high",
+          title: "Carrier offer near midpoint",
+          message: `Carrier at $${carrierAsk} for ${lane || "lane"} (midpoint ~$${mid}). Owner may want to step in.`,
+          meta: { lane, carrierAsk, midpoint: mid, postedRate }
+        });
       } catch {}
     }
 
-    await logEvent("draft_negotiate", {
-      lane,
-      postedRate,
-      mid,
-      high,
-      carrierAsk,
-      negotiationRound,
-      lastCounter,
-      counter,
-      decision: result.decision
-    });
+    // ----------------------------
+    // FLOW STEP 2/3:
+    // If carrier is at or below midpoint -> lock it down ("Let's do it")
+    // If carrier is above midpoint -> first counter is 685-style
+    // If after first counter they counter again and they are NOT at midpoint -> go to midpoint
+    // ----------------------------
 
-    return json(res, 200, { ok: true, result });
+    const negotiationStage = String(body.stage || "").toLowerCase(); 
+    // Accepted values (optional): "", "first_counter_sent", "midpoint_sent"
+    const lastCounter = numOrNull(body.last_counter_rate);
+
+    // If carrier is at/below midpoint, lock it immediately (your instruction: if they are at midpoint price then lock them down)
+    if (carrierAsk <= mid) {
+      const lockRate = carrierAsk; // if they offer below midpoint, even better; still lock it
+
+      const result = {
+        decision: "lock",
+        counter_rate: lockRate,
+        midpoint_rate: mid,
+        max_rate_without_owner: high ?? null,
+        draft_reply_text: formatLock(lockRate),
+        reasoning: `Carrier at/below midpoint (carrier $${carrierAsk}, midpoint $${mid}). Lock it.`,
+        owner_alert: null
+      };
+
+      await logEvent("draft_negotiate", { lane, step: "lock", postedRate, low, high, mid, carrierAsk, lockRate });
+      return json(res, 200, { ok: true, result });
+    }
+
+    // Carrier above midpoint:
+    // If we have NOT sent first counter yet -> send the 685-style counter
+    const firstCounter = computeFirstCounter({ postedRate, carrierAsk });
+    const firstCounterCapped = Math.min(firstCounter, mid);
+
+    const firstCounterAlreadySent =
+      negotiationStage === "first_counter_sent" ||
+      (lastCounter != null && lastCounter > 0 && lastCounter < mid);
+
+    if (!firstCounterAlreadySent) {
+      const result = {
+        decision: "counter",
+        counter_rate: firstCounterCapped,
+        midpoint_rate: mid,
+        max_rate_without_owner: high ?? null,
+        draft_reply_text: formatCounter(firstCounterCapped),
+        reasoning: `First counter. Posted $${postedRate}, carrier $${carrierAsk}. Counter $${firstCounterCapped}.`,
+        owner_alert: null
+      };
+
+      await logEvent("draft_negotiate", { lane, step: "first_counter", postedRate, low, high, mid, carrierAsk, counter: firstCounterCapped });
+      return json(res, 200, { ok: true, result });
+    }
+
+    // If first counter already happened and carrier is STILL not at midpoint -> counter midpoint
+    const resultMid = {
+      decision: "counter_midpoint",
+      counter_rate: mid,
+      midpoint_rate: mid,
+      max_rate_without_owner: high ?? null,
+      draft_reply_text: formatCounter(mid),
+      reasoning: `Second counter: go straight to midpoint $${mid}. Carrier currently $${carrierAsk}.`,
+      owner_alert: null
+    };
+
+    // If they go quiet after midpoint and were within 100 of midpoint, alert owner
+    if (noResponseAfterMidpoint && Math.abs(carrierAsk - mid) <= 100) {
+      resultMid.owner_alert = {
+        severity: "high",
+        title: "No response after midpoint",
+        message: `Carrier last at $${carrierAsk} for ${lane || "lane"} (midpoint $${mid}) and went quiet after midpoint. Owner decision needed.`,
+        meta: { lane, postedRate, midpoint: mid, carrierAsk }
+      };
+      try { await createAlert(resultMid.owner_alert); } catch {}
+    }
+
+    await logEvent("draft_negotiate", { lane, step: "midpoint_counter", postedRate, low, high, mid, carrierAsk, counter: mid, noResponseAfterMidpoint });
+    return json(res, 200, { ok: true, result: resultMid });
   }
 
   await logEvent("unknown_route", { path: req.url, method: req.method });
