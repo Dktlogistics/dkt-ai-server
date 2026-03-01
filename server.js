@@ -6,13 +6,12 @@ function unauthorized(res) {
 }
 
 const server = http.createServer((req, res) => {
-  // Require a secret token to access the service
   const token = req.headers["authorization"];
   const expected = process.env.AUTH_TOKEN;
 
   if (!expected) {
     res.writeHead(500, { "Content-Type": "text/plain" });
-    return res.end("Server misconfigured: missing AUTH_TOKEN");
+    return res.end("Server misconfigured");
   }
 
   if (!token || token !== `Bearer ${expected}`) {
