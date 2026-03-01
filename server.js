@@ -2,16 +2,14 @@ const http = require("http");
 const { Pool } = require("pg");
 
 // --------------------
-// DB (Render provides DATABASE_URL)
+// DB
 // --------------------
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  // Render Postgres commonly requires SSL. This setting is safe for hosted DBs.
   ssl: process.env.DATABASE_URL ? { rejectUnauthorized: false } : undefined
 });
 
 async function ensureTables() {
-  // Audit log table
   await pool.query(`
     CREATE TABLE IF NOT EXISTS audit_log (
       id BIGSERIAL PRIMARY KEY,
@@ -21,7 +19,6 @@ async function ensureTables() {
     );
   `);
 
-  // App config table (stores your rules/settings as JSON)
   await pool.query(`
     CREATE TABLE IF NOT EXISTS app_config (
       key TEXT PRIMARY KEY,
@@ -38,7 +35,6 @@ async function logEvent(eventType, details = {}) {
       [eventType, JSON.stringify(details)]
     );
   } catch (e) {
-    // Never crash the server if logging fails
     console.error("Audit log insert failed:", e?.message || e);
   }
 }
@@ -73,36 +69,27 @@ function json(res, status, obj) {
 function readBody(req) {
   return new Promise((resolve, reject) => {
     let data = "";
-    req.on("data", chunk => (data += chunk));
+    req.on("data", (chunk) => (data += chunk));
     req.on("end", () => resolve(data));
     req.on("error", reject);
   });
 }
 
 // --------------------
-// OpenAI call (email classification only for now)
+// OpenAI
 // --------------------
-async function callOpenAIForClassification(text) {
+async function openaiChatJSON({ system, user, maxTokens = 500 }) {
   const apiKey = process.env.OPENAI_API_KEY;
-
-  if (!apiKey) {
-    return { category: "unknown", confidence: 0, reason: "OPENAI_API_KEY not set" };
-  }
+  if (!apiKey) return { error: "OPENAI_API_KEY not set" };
 
   const payload = {
     model: "gpt-4.1-mini",
     messages: [
-      {
-        role: "system",
-        content:
-          "You classify logistics emails. Output ONLY valid JSON with keys: category (carrier|customer|spam|other), confidence (0-1), reason."
-      },
-      {
-        role: "user",
-        content: `Classify this email:\n\n${text}`
-      }
+      { role: "system", content: system },
+      { role: "user", content: user }
     ],
-    temperature: 0
+    temperature: 0,
+    max_tokens: maxTokens
   };
 
   const resp = await fetch("https://api.openai.com/v1/chat/completions", {
@@ -116,16 +103,15 @@ async function callOpenAIForClassification(text) {
 
   if (!resp.ok) {
     const errText = await resp.text();
-    return { category: "unknown", confidence: 0, reason: `OpenAI error: ${resp.status} ${errText}` };
+    return { error: `OpenAI error: ${resp.status} ${errText}` };
   }
 
   const data = await resp.json();
   const content = data?.choices?.[0]?.message?.content?.trim() || "{}";
-
   try {
     return JSON.parse(content);
   } catch {
-    return { category: "unknown", confidence: 0, reason: "Model returned non-JSON" };
+    return { error: "Model returned non-JSON", raw: content };
   }
 }
 
@@ -133,7 +119,7 @@ let tablesReady = false;
 
 const server = http.createServer(async (req, res) => {
   // --------------------
-  // AUTH (server locked)
+  // AUTH (locked server)
   // --------------------
   const token = req.headers["authorization"];
   const expected = process.env.AUTH_TOKEN;
@@ -155,14 +141,12 @@ const server = http.createServer(async (req, res) => {
   // --------------------
   // ROUTES
   // --------------------
-
-  // Health check
   if (req.url === "/health" && req.method === "GET") {
     await logEvent("health_check", {});
     return json(res, 200, { ok: true });
   }
 
-  // Save rules config (owner-only, secured)
+  // Save rules config
   if (req.url === "/config/rules" && req.method === "POST") {
     const bodyText = await readBody(req);
     let body;
@@ -172,22 +156,19 @@ const server = http.createServer(async (req, res) => {
       await logEvent("config_rules_error", { reason: "invalid_json" });
       return json(res, 400, { error: "Invalid JSON body" });
     }
-
-    // Store exactly what you send (no secrets)
     await setConfig("rules", body);
     await logEvent("config_rules_saved", { keys: Object.keys(body || {}) });
-
     return json(res, 200, { ok: true });
   }
 
-  // Read rules config (owner-only, secured)
+  // Read rules config
   if (req.url === "/config/rules" && req.method === "GET") {
     const rules = await getConfig("rules");
     await logEvent("config_rules_read", {});
     return json(res, 200, { rules });
   }
 
-  // Classify email (Phase 1 safe feature)
+  // Classify email
   if (req.url === "/classify-email" && req.method === "POST") {
     const bodyText = await readBody(req);
     let body;
@@ -199,17 +180,80 @@ const server = http.createServer(async (req, res) => {
     }
 
     const emailText = (body.email_text || "").toString().slice(0, 8000);
-    if (!emailText) {
-      await logEvent("classify_email_error", { reason: "missing_email_text" });
-      return json(res, 400, { error: "Missing email_text" });
-    }
+    if (!emailText) return json(res, 400, { error: "Missing email_text" });
 
-    const result = await callOpenAIForClassification(emailText);
+    const system =
+      "You classify logistics emails. Output ONLY valid JSON with keys: category (carrier|customer|spam|other), confidence (0-1), reason.";
+    const user = `Classify this email:\n\n${emailText}`;
+
+    const result = await openaiChatJSON({ system, user, maxTokens: 200 });
     await logEvent("classify_email", { result });
     return json(res, 200, result);
   }
 
-  // Default
+  // NEW: Draft a carrier reply (Phase 1, draft-only)
+  if (req.url === "/draft/carrier-reply" && req.method === "POST") {
+    const rules = (await getConfig("rules")) || {};
+    const safetyMode = rules?.safety?.mode || "draft_only";
+
+    const bodyText = await readBody(req);
+    let body;
+    try {
+      body = JSON.parse(bodyText || "{}");
+    } catch {
+      await logEvent("draft_reply_error", { reason: "invalid_json" });
+      return json(res, 400, { error: "Invalid JSON body" });
+    }
+
+    const emailText = (body.email_text || "").toString().slice(0, 8000);
+    if (!emailText) return json(res, 400, { error: "Missing email_text" });
+
+    // We do NOT access TAI/DAT/Highway yet in Phase 1.
+    // We only draft a reply in your format and identify missing MC.
+    const system = `
+You are DKT Logistics' carrier email assistant.
+You MUST follow the rules provided. You are in SAFETY MODE: ${safetyMode}.
+You are NOT allowed to send emails, post loads, or change any system. Draft only.
+
+Output ONLY valid JSON with keys:
+- lane_guess (string)
+- mc_found (boolean)
+- mc_value (string|null)
+- needs_mc_request (boolean)
+- draft_reply_text (string)  // must follow template format from rules.email_handling.template_format + details_line
+- negotiation_next_line (string) // short suggested next line if carrier asks rate or offers high
+- notes_for_owner (string) // short bullet style
+`;
+
+    const user = `
+RULES (JSON):
+${JSON.stringify(rules)}
+
+INCOMING EMAIL TEXT:
+${emailText}
+
+TASK:
+1) Guess lane from email (like "Seymour IN to Cookeville TN") if present.
+2) Detect MC/DOT if present.
+3) Produce a draft reply using the exact template format in rules.email_handling.template_format.
+   Since Phase 1 has no TAI access, if pickup/delivery times/commodity/weight are unknown, draft reply should:
+   - ask one clarifying question: "Can you confirm pickup/delivery times, weight, and commodity?" (keep it short)
+   - still ask MC if missing.
+4) Keep tone polite and not overly formal.
+Return ONLY JSON.
+`;
+
+    const result = await openaiChatJSON({ system, user, maxTokens: 700 });
+
+    await logEvent("draft_carrier_reply", {
+      lane_guess: result?.lane_guess,
+      mc_found: result?.mc_found,
+      needs_mc_request: result?.needs_mc_request
+    });
+
+    return json(res, 200, { ok: true, result });
+  }
+
   await logEvent("unknown_route", { path: req.url, method: req.method });
   return json(res, 200, { status: "DKT AI server running (secured)" });
 });
