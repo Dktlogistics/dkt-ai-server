@@ -76,9 +76,9 @@ function readBody(req) {
 }
 
 // --------------------
-// OpenAI
+// OpenAI helper (JSON only)
 // --------------------
-async function openaiChatJSON({ system, user, maxTokens = 500 }) {
+async function openaiChatJSON({ system, user, maxTokens = 800 }) {
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) return { error: "OPENAI_API_KEY not set" };
 
@@ -113,6 +113,31 @@ async function openaiChatJSON({ system, user, maxTokens = 500 }) {
   } catch {
     return { error: "Model returned non-JSON", raw: content };
   }
+}
+
+function isNonEmptyString(x) {
+  return typeof x === "string" && x.trim().length > 0;
+}
+
+function normalizeLoadContext(ctx = {}) {
+  // Only allow expected keys (guardrail)
+  const safe = {
+    pickup_fcfs_or_appt: ctx.pickup_fcfs_or_appt ?? null,
+    pickup_time_window_military: ctx.pickup_time_window_military ?? null,
+    pickup_city_state: ctx.pickup_city_state ?? null,
+    delivery_fcfs_or_appt: ctx.delivery_fcfs_or_appt ?? null,
+    delivery_time_window_military: ctx.delivery_time_window_military ?? null,
+    delivery_city_state: ctx.delivery_city_state ?? null,
+    weight_lbs: ctx.weight_lbs ?? null,
+    commodity_desc: ctx.commodity_desc ?? null,
+    posted_rate: ctx.posted_rate ?? null
+  };
+
+  // Basic cleanup
+  for (const k of Object.keys(safe)) {
+    if (typeof safe[k] === "string") safe[k] = safe[k].trim();
+  }
+  return safe;
 }
 
 let tablesReady = false;
@@ -168,30 +193,7 @@ const server = http.createServer(async (req, res) => {
     return json(res, 200, { rules });
   }
 
-  // Classify email
-  if (req.url === "/classify-email" && req.method === "POST") {
-    const bodyText = await readBody(req);
-    let body;
-    try {
-      body = JSON.parse(bodyText || "{}");
-    } catch {
-      await logEvent("classify_email_error", { reason: "invalid_json" });
-      return json(res, 400, { error: "Invalid JSON body" });
-    }
-
-    const emailText = (body.email_text || "").toString().slice(0, 8000);
-    if (!emailText) return json(res, 400, { error: "Missing email_text" });
-
-    const system =
-      "You classify logistics emails. Output ONLY valid JSON with keys: category (carrier|customer|spam|other), confidence (0-1), reason.";
-    const user = `Classify this email:\n\n${emailText}`;
-
-    const result = await openaiChatJSON({ system, user, maxTokens: 200 });
-    await logEvent("classify_email", { result });
-    return json(res, 200, result);
-  }
-
-  // NEW: Draft a carrier reply (Phase 1, draft-only)
+  // Draft a carrier reply (Phase 1, draft-only)
   if (req.url === "/draft/carrier-reply" && req.method === "POST") {
     const rules = (await getConfig("rules")) || {};
     const safetyMode = rules?.safety?.mode || "draft_only";
@@ -205,24 +207,43 @@ const server = http.createServer(async (req, res) => {
       return json(res, 400, { error: "Invalid JSON body" });
     }
 
-    const emailText = (body.email_text || "").toString().slice(0, 8000);
+    const emailText = (body.email_text || "").toString().slice(0, 12000);
     if (!emailText) return json(res, 400, { error: "Missing email_text" });
 
-    // We do NOT access TAI/DAT/Highway yet in Phase 1.
-    // We only draft a reply in your format and identify missing MC.
+    const loadContext = normalizeLoadContext(body.load_context || {});
+    const haveAllLoadDetails =
+      isNonEmptyString(loadContext.pickup_fcfs_or_appt) &&
+      isNonEmptyString(loadContext.pickup_time_window_military) &&
+      isNonEmptyString(loadContext.pickup_city_state) &&
+      isNonEmptyString(loadContext.delivery_fcfs_or_appt) &&
+      isNonEmptyString(loadContext.delivery_time_window_military) &&
+      isNonEmptyString(loadContext.delivery_city_state) &&
+      (typeof loadContext.weight_lbs === "number" || isNonEmptyString(String(loadContext.weight_lbs || ""))) &&
+      isNonEmptyString(loadContext.commodity_desc);
+
     const system = `
 You are DKT Logistics' carrier email assistant.
-You MUST follow the rules provided. You are in SAFETY MODE: ${safetyMode}.
+You MUST follow the rules provided.
+You are in SAFETY MODE: ${safetyMode}.
 You are NOT allowed to send emails, post loads, or change any system. Draft only.
+
+Hard requirements:
+- Format the load details EXACTLY like DKT wants:
+  Line 1: "Picks up {pickup_fcfs_or_appt} {pickup_time_window_military} in {pickup_city_state}"
+  Line 2: "Delivers to {delivery_city_state} {delivery_fcfs_or_appt} {delivery_time_window_military}"
+  Line 3: "Truckload of {commodity_desc} weighing {weight_lbs}lbs"
+- Ask for MC ONLY if you did not find it in the email.
+- If load_context contains the needed fields, DO NOT ask to confirm pickup/delivery times, weight, or commodity.
+- Keep tone polite, short, not overly formal.
 
 Output ONLY valid JSON with keys:
 - lane_guess (string)
 - mc_found (boolean)
 - mc_value (string|null)
 - needs_mc_request (boolean)
-- draft_reply_text (string)  // must follow template format from rules.email_handling.template_format + details_line
-- negotiation_next_line (string) // short suggested next line if carrier asks rate or offers high
-- notes_for_owner (string) // short bullet style
+- draft_reply_text (string)
+- negotiation_next_line (string)
+- notes_for_owner (string)
 `;
 
     const user = `
@@ -232,23 +253,26 @@ ${JSON.stringify(rules)}
 INCOMING EMAIL TEXT:
 ${emailText}
 
+LOAD_CONTEXT (may be empty; if present, trust it):
+${JSON.stringify(loadContext)}
+
 TASK:
-1) Guess lane from email (like "Seymour IN to Cookeville TN") if present.
-2) Detect MC/DOT if present.
-3) Produce a draft reply using the exact template format in rules.email_handling.template_format.
-   Since Phase 1 has no TAI access, if pickup/delivery times/commodity/weight are unknown, draft reply should:
-   - ask one clarifying question: "Can you confirm pickup/delivery times, weight, and commodity?" (keep it short)
-   - still ask MC if missing.
-4) Keep tone polite and not overly formal.
+1) Guess lane from email if present (e.g., "Seymour IN to Cookeville TN").
+2) Detect MC/DOT in the email if present. If none found, set mc_found=false and needs_mc_request=true.
+3) Draft reply using the 3-line required format. Use LOAD_CONTEXT values if provided.
+4) If LOAD_CONTEXT is missing key details, ask ONE short clarifying question:
+   "Can you confirm pickup/delivery times, weight, and commodity?"
+5) If MC is missing, include: "${rules?.email_handling?.ask_mc_if_missing || "What is your MC number?"}"
+6) Provide a short negotiation_next_line aligned with DKT strategy.
 Return ONLY JSON.
 `;
 
-    const result = await openaiChatJSON({ system, user, maxTokens: 700 });
+    const result = await openaiChatJSON({ system, user, maxTokens: 900 });
 
     await logEvent("draft_carrier_reply", {
       lane_guess: result?.lane_guess,
       mc_found: result?.mc_found,
-      needs_mc_request: result?.needs_mc_request
+      used_load_context: haveAllLoadDetails
     });
 
     return json(res, 200, { ok: true, result });
