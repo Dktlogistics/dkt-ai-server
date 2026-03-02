@@ -1,3 +1,11 @@
+// DKT LOGISTICS AI SERVER (Render / Node)
+// NOTE: Per your instruction, negotiation + replies from carrier email → “Let’s do it”
+// remain the same in wording/logic. We are only:
+//  - switching live email sending to Gmail (OAuth)
+//  - fixing load_ops uniqueness (NOT lane_key unique; allow multiple loads per lane)
+//  - adding Gmail inbound processing + optional polling hooks
+//  - keeping DAT/TAI/Highway as scaffolds until credentials are provided
+
 const http = require("http");
 const { Pool } = require("pg");
 
@@ -73,15 +81,15 @@ async function ensureTables() {
     WHERE is_active = TRUE;
   `);
 
-  // ✅ NEW: load operations queue (AI system of record; TAI remains system of record for booking)
+  // ✅ load operations queue (AI system of record; TAI remains system of record for booking)
   await pool.query(`
     CREATE TABLE IF NOT EXISTS load_ops (
       id BIGSERIAL PRIMARY KEY,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 
-      tai_load_id TEXT,              -- whatever identifier you have from TAI (read-only)
-      lane_key TEXT NOT NULL,
+      tai_load_id TEXT,              -- identifier from TAI if you have it (read-only)
+      lane_key TEXT NOT NULL,        -- NOT UNIQUE; multiple loads can share same lane
 
       pickup_city_state TEXT,
       delivery_city_state TEXT,
@@ -127,6 +135,19 @@ async function ensureTables() {
     CREATE INDEX IF NOT EXISTS load_ops_lane_key_idx
     ON load_ops (lane_key);
   `);
+
+  // ✅ IMPORTANT: tai_load_id should be unique when present (NOT lane_key)
+  await pool.query(`
+    CREATE UNIQUE INDEX IF NOT EXISTS load_ops_tai_load_id_unique
+    ON load_ops (tai_load_id)
+    WHERE tai_load_id IS NOT NULL;
+  `);
+
+  // ✅ MIGRATION SAFETY: if a prior version created a unique lane_key index, drop it.
+  // This prevents overwriting loads when multiple loads share same lane.
+  try {
+    await pool.query(`DROP INDEX IF EXISTS load_ops_lane_key_unique;`);
+  } catch {}
 }
 
 async function logEvent(eventType, details = {}) {
@@ -334,6 +355,66 @@ async function upsertLoadOpsFromIngest({ tai_load_id, load_context, meta = {} })
   else if (missingRateView) status = "blocked_missing_data";
   else status = "ready_to_post";
 
+  const taiId = cleanStr(tai_load_id);
+
+  // ✅ If tai_load_id present: upsert by tai_load_id (unique when not null)
+  if (taiId) {
+    const r = await pool.query(
+      `
+      INSERT INTO load_ops (
+        tai_load_id, lane_key,
+        pickup_city_state, delivery_city_state, weight_lbs, commodity_desc,
+        pickup_fcfs_or_appt, pickup_time_window_military,
+        delivery_fcfs_or_appt, delivery_time_window_military,
+        posted_rate, rateview_low, rateview_high, midpoint_rate,
+        is_designated, status, meta, updated_at
+      )
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17::jsonb,NOW())
+      ON CONFLICT (tai_load_id) DO UPDATE SET
+        lane_key = EXCLUDED.lane_key,
+        pickup_city_state = EXCLUDED.pickup_city_state,
+        delivery_city_state = EXCLUDED.delivery_city_state,
+        weight_lbs = EXCLUDED.weight_lbs,
+        commodity_desc = EXCLUDED.commodity_desc,
+        pickup_fcfs_or_appt = EXCLUDED.pickup_fcfs_or_appt,
+        pickup_time_window_military = EXCLUDED.pickup_time_window_military,
+        delivery_fcfs_or_appt = EXCLUDED.delivery_fcfs_or_appt,
+        delivery_time_window_military = EXCLUDED.delivery_time_window_military,
+        posted_rate = EXCLUDED.posted_rate,
+        rateview_low = EXCLUDED.rateview_low,
+        rateview_high = EXCLUDED.rateview_high,
+        midpoint_rate = EXCLUDED.midpoint_rate,
+        is_designated = EXCLUDED.is_designated,
+        status = EXCLUDED.status,
+        meta = EXCLUDED.meta,
+        updated_at = NOW()
+      RETURNING id, tai_load_id, lane_key, status, is_designated
+      `,
+      [
+        taiId,
+        laneKey,
+        cleanStr(lc.pickup_city_state),
+        cleanStr(lc.delivery_city_state),
+        cleanStr(lc.weight_lbs),
+        cleanStr(lc.commodity_desc),
+        cleanStr(lc.pickup_fcfs_or_appt),
+        cleanStr(lc.pickup_time_window_military),
+        cleanStr(lc.delivery_fcfs_or_appt),
+        cleanStr(lc.delivery_time_window_military),
+        postedRate,
+        low,
+        high,
+        mid,
+        designated,
+        status,
+        JSON.stringify(meta || {})
+      ]
+    );
+
+    return { ok: true, record: r.rows?.[0], laneKey, designated, status };
+  }
+
+  // ✅ If no tai_load_id: insert a new load (do NOT upsert by lane_key)
   const r = await pool.query(
     `
     INSERT INTO load_ops (
@@ -345,28 +426,10 @@ async function upsertLoadOpsFromIngest({ tai_load_id, load_context, meta = {} })
       is_designated, status, meta, updated_at
     )
     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17::jsonb,NOW())
-    ON CONFLICT (lane_key) DO UPDATE SET
-      tai_load_id = EXCLUDED.tai_load_id,
-      pickup_city_state = EXCLUDED.pickup_city_state,
-      delivery_city_state = EXCLUDED.delivery_city_state,
-      weight_lbs = EXCLUDED.weight_lbs,
-      commodity_desc = EXCLUDED.commodity_desc,
-      pickup_fcfs_or_appt = EXCLUDED.pickup_fcfs_or_appt,
-      pickup_time_window_military = EXCLUDED.pickup_time_window_military,
-      delivery_fcfs_or_appt = EXCLUDED.delivery_fcfs_or_appt,
-      delivery_time_window_military = EXCLUDED.delivery_time_window_military,
-      posted_rate = EXCLUDED.posted_rate,
-      rateview_low = EXCLUDED.rateview_low,
-      rateview_high = EXCLUDED.rateview_high,
-      midpoint_rate = EXCLUDED.midpoint_rate,
-      is_designated = EXCLUDED.is_designated,
-      status = EXCLUDED.status,
-      meta = EXCLUDED.meta,
-      updated_at = NOW()
-    RETURNING id, lane_key, status, is_designated
+    RETURNING id, tai_load_id, lane_key, status, is_designated
     `,
     [
-      cleanStr(tai_load_id),
+      null,
       laneKey,
       cleanStr(lc.pickup_city_state),
       cleanStr(lc.delivery_city_state),
@@ -387,21 +450,6 @@ async function upsertLoadOpsFromIngest({ tai_load_id, load_context, meta = {} })
   );
 
   return { ok: true, record: r.rows?.[0], laneKey, designated, status };
-}
-
-// NOTE: we want lane_key unique-ish; simplest is to enforce uniqueness by index.
-// We'll create it safely here.
-async function ensureLoadOpsLaneKeyUnique() {
-  await pool.query(`
-    DO $$
-    BEGIN
-      IF NOT EXISTS (
-        SELECT 1 FROM pg_indexes WHERE indexname = 'load_ops_lane_key_unique'
-      ) THEN
-        EXECUTE 'CREATE UNIQUE INDEX load_ops_lane_key_unique ON load_ops (lane_key)';
-      END IF;
-    END $$;
-  `);
 }
 
 async function listActiveLoads({ limit = 100, status = null } = {}) {
@@ -465,6 +513,7 @@ async function updateLoadOps(id, patch = {}) {
 }
 
 async function getLoadByLaneKey(lane_key) {
+  // Returns the most recent load on this lane
   const r = await pool.query(
     `SELECT * FROM load_ops WHERE lane_key = $1 ORDER BY id DESC LIMIT 1`,
     [String(lane_key)]
@@ -644,41 +693,354 @@ function requireLiveCapability(rules, capabilityName) {
 }
 
 // --------------------
-// Live Email Sender (SendGrid via HTTP)
-// ENV required:
-//  SENDGRID_API_KEY
-//  EMAIL_FROM
+// ✅ Gmail (OAuth) Email Sender + Reader
+// ENV required on Render:
+//  GMAIL_CLIENT_ID
+//  GMAIL_CLIENT_SECRET
+//  GMAIL_REFRESH_TOKEN
+//  GMAIL_USER   (your Gmail address, or "me")
+// Optional:
+//  GMAIL_POLL_QUERY (defaults to "is:unread newer_than:1d")
 // --------------------
-async function sendEmailSendGrid({ to, subject, text }) {
+async function gmailAccessToken() {
   if (!fetchFn) return { ok: false, error: "fetch not available" };
 
-  const apiKey = process.env.SENDGRID_API_KEY;
-  const from = process.env.EMAIL_FROM;
+  const client_id = process.env.GMAIL_CLIENT_ID;
+  const client_secret = process.env.GMAIL_CLIENT_SECRET;
+  const refresh_token = process.env.GMAIL_REFRESH_TOKEN;
 
-  if (!apiKey) return { ok: false, error: "SENDGRID_API_KEY not set" };
-  if (!from) return { ok: false, error: "EMAIL_FROM not set" };
-  if (!to) return { ok: false, error: "Missing 'to'" };
+  if (!client_id || !client_secret || !refresh_token) {
+    return { ok: false, error: "Missing Gmail OAuth env vars" };
+  }
 
-  const payload = {
-    personalizations: [{ to: [{ email: to }], subject: subject || "" }],
-    from: { email: from },
-    content: [{ type: "text/plain", value: String(text || "") }]
+  const params = new URLSearchParams();
+  params.set("client_id", client_id);
+  params.set("client_secret", client_secret);
+  params.set("refresh_token", refresh_token);
+  params.set("grant_type", "refresh_token");
+
+  const resp = await fetchFn("https://oauth2.googleapis.com/token", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: params.toString()
+  });
+
+  if (!resp.ok) {
+    const t = await resp.text();
+    return { ok: false, error: `Token refresh failed: ${resp.status} ${t}` };
+  }
+  const data = await resp.json();
+  return { ok: true, access_token: data.access_token };
+}
+
+function b64urlDecode(str) {
+  const s = String(str || "").replace(/-/g, "+").replace(/_/g, "/");
+  const pad = s.length % 4 ? "=".repeat(4 - (s.length % 4)) : "";
+  return Buffer.from(s + pad, "base64").toString("utf8");
+}
+
+async function gmailListMessages({ q, maxResults = 10 }) {
+  const tok = await gmailAccessToken();
+  if (!tok.ok) return tok;
+
+  const user = process.env.GMAIL_USER || "me";
+  const url = new URL(`https://gmail.googleapis.com/gmail/v1/users/${encodeURIComponent(user)}/messages`);
+  if (q) url.searchParams.set("q", q);
+  url.searchParams.set("maxResults", String(Math.max(1, Math.min(50, Number(maxResults) || 10))));
+
+  const resp = await fetchFn(url.toString(), {
+    headers: { Authorization: `Bearer ${tok.access_token}` }
+  });
+  if (!resp.ok) {
+    const t = await resp.text();
+    return { ok: false, error: `Gmail list failed: ${resp.status} ${t}` };
+  }
+  const data = await resp.json();
+  return { ok: true, messages: data.messages || [] };
+}
+
+async function gmailGetMessage(messageId) {
+  const tok = await gmailAccessToken();
+  if (!tok.ok) return tok;
+
+  const user = process.env.GMAIL_USER || "me";
+  const url = `https://gmail.googleapis.com/gmail/v1/users/${encodeURIComponent(user)}/messages/${encodeURIComponent(messageId)}?format=full`;
+
+  const resp = await fetchFn(url, { headers: { Authorization: `Bearer ${tok.access_token}` } });
+  if (!resp.ok) {
+    const t = await resp.text();
+    return { ok: false, error: `Gmail get failed: ${resp.status} ${t}` };
+  }
+  const msg = await resp.json();
+
+  const headers = msg.payload?.headers || [];
+  const getHeader = (name) => headers.find(h => (h.name || "").toLowerCase() === name.toLowerCase())?.value || "";
+
+  function findTextPart(part) {
+    if (!part) return null;
+    if (part.mimeType === "text/plain" && part.body?.data) return b64urlDecode(part.body.data);
+    if (Array.isArray(part.parts)) {
+      for (const p of part.parts) {
+        const found = findTextPart(p);
+        if (found) return found;
+      }
+    }
+    return null;
+  }
+
+  const text = findTextPart(msg.payload) || "";
+  return {
+    ok: true,
+    id: msg.id,
+    threadId: msg.threadId,
+    internalDate: msg.internalDate,
+    from: getHeader("From"),
+    subject: getHeader("Subject"),
+    text
   };
+}
 
-  const resp = await fetchFn("https://api.sendgrid.com/v3/mail/send", {
+async function gmailMarkRead(messageId) {
+  const tok = await gmailAccessToken();
+  if (!tok.ok) return tok;
+
+  const user = process.env.GMAIL_USER || "me";
+  const url = `https://gmail.googleapis.com/gmail/v1/users/${encodeURIComponent(user)}/messages/${encodeURIComponent(messageId)}/modify`;
+
+  const resp = await fetchFn(url, {
     method: "POST",
     headers: {
-      Authorization: `Bearer ${apiKey}`,
+      Authorization: `Bearer ${tok.access_token}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({ removeLabelIds: ["UNREAD"] })
+  });
+
+  if (!resp.ok) {
+    const t = await resp.text();
+    return { ok: false, error: `Gmail modify failed: ${resp.status} ${t}` };
+  }
+  return { ok: true };
+}
+
+async function gmailSendEmail({ to, subject, text, threadId = null }) {
+  const tok = await gmailAccessToken();
+  if (!tok.ok) return tok;
+
+  const user = process.env.GMAIL_USER || "me";
+  if (!to) return { ok: false, error: "Missing 'to'" };
+
+  const rawLines = [
+    `To: ${to}`,
+    `Subject: ${subject || ""}`,
+    "Content-Type: text/plain; charset=utf-8",
+    "",
+    text || ""
+  ];
+
+  const raw = Buffer.from(rawLines.join("\r\n"), "utf8")
+    .toString("base64")
+    .replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+
+  const payload = threadId ? { raw, threadId } : { raw };
+
+  const resp = await fetchFn(`https://gmail.googleapis.com/gmail/v1/users/${encodeURIComponent(user)}/messages/send`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${tok.access_token}`,
       "Content-Type": "application/json"
     },
     body: JSON.stringify(payload)
   });
 
   if (!resp.ok) {
-    const errText = await resp.text();
-    return { ok: false, error: `SendGrid error: ${resp.status} ${errText}` };
+    const t = await resp.text();
+    return { ok: false, error: `Gmail send failed: ${resp.status} ${t}` };
   }
   return { ok: true };
+}
+
+function extractEmailAddress(fromHeader) {
+  const s = String(fromHeader || "");
+  const m = s.match(/<([^>]+)>/);
+  return cleanStr(m?.[1] || s);
+}
+
+function extractCityStateLaneFromText(subject, text) {
+  const s = `${subject || ""} ${text || ""}`.replace(/\s+/g, " ").trim();
+  // Example: "Seymour IN to Cookeville TN"
+  const m = s.match(/([A-Za-z .'-]+)\s*,?\s*([A-Za-z]{2})\s*(?:to|\-+|→)\s*([A-Za-z .'-]+)\s*,?\s*([A-Za-z]{2})/i);
+  if (!m) return null;
+  return {
+    pickup_city_state: `${m[1].trim()} ${m[2].toUpperCase()}`,
+    delivery_city_state: `${m[3].trim()} ${m[4].toUpperCase()}`
+  };
+}
+
+async function findLatestLoadByCityState({ pickup_city_state, delivery_city_state }) {
+  const pick = splitCityState(pickup_city_state);
+  const del = splitCityState(delivery_city_state);
+  const laneKey = makeLaneKey(pick.city, pick.state, del.city, del.state);
+  if (!laneKey) return { ok: false, error: "Cannot build lane_key", laneKey: null, load: null };
+
+  const r = await pool.query(
+    `
+    SELECT *
+    FROM load_ops
+    WHERE lane_key = $1
+      AND status NOT IN ('closed')
+    ORDER BY id DESC
+    LIMIT 1
+    `,
+    [laneKey]
+  );
+  return { ok: true, laneKey, load: r.rows?.[0] || null };
+}
+
+// --------------------
+// ✅ Shared live negotiation runner (keeps your exact wording/logic)
+// Used by /live/negotiate-and-send and Gmail inbound autopilot.
+// --------------------
+async function runLiveNegotiateAndSend({ lane_key, email_from, email_text, stage, thread_id = null }) {
+  const rules = (await getConfig("rules")) || {};
+  const cap = requireLiveCapability(rules, "email");
+  if (!cap.ok) {
+    await logEvent("live_negotiate_blocked", { reason: cap.reason, lane_key, email_from });
+    return { ok: false, status: 403, error: "Live actions disabled", reason: cap.reason };
+  }
+
+  const load = await getLoadByLaneKey(lane_key);
+  if (!load) return { ok: false, status: 404, error: "No load found for lane_key. Ingest it first." };
+
+  if (load.is_designated) {
+    try {
+      await createAlert({
+        severity: "high",
+        title: "Designated lane — autopilot blocked",
+        message: "Carrier message received but AI is blocked on this lane.",
+        meta: { lane_key, email_from }
+      });
+    } catch {}
+    await logEvent("live_negotiate_blocked_designated", { lane_key, email_from });
+    return { ok: true, status: 200, blocked: true, reason: "designated_lane" };
+  }
+
+  // validate RateView required
+  const postedRate = numOrNull(load.posted_rate);
+  const low = numOrNull(load.rateview_low);
+  const high = numOrNull(load.rateview_high);
+  const mid = numOrNull(load.midpoint_rate) ?? midpointFromLowHigh(low, high);
+
+  if (!postedRate || !low || !high || !mid) {
+    try {
+      await createAlert({
+        severity: "high",
+        title: "Autopilot blocked — missing RateView",
+        message: "Load missing posted/low/high/mid; AI cannot run live.",
+        meta: { lane_key }
+      });
+    } catch {}
+    await updateLoadOps(load.id, { status: "blocked_missing_data" });
+    await logEvent("live_negotiate_blocked_missing_data", { lane_key });
+    return { ok: false, status: 400, error: "Missing required RateView/posted rates for live autopilot." };
+  }
+
+  // parse carrier ask
+  let carrierAsk = parseRateFromText(email_text);
+
+  // above high => owner alert only, no email
+  if (carrierAsk != null && carrierAsk > high) {
+    try {
+      await createAlert({
+        severity: "high",
+        title: "Carrier ask above high",
+        message: `Carrier asked $${carrierAsk} (above high $${high}). Owner handle.`,
+        meta: { lane_key, carrierAsk, high }
+      });
+    } catch {}
+    await updateLoadOps(load.id, { status: "negotiating", last_carrier_ask: carrierAsk, last_inbound_ts: new Date().toISOString() });
+    await logEvent("live_negotiate_escalate_above_high", { lane_key, carrierAsk, high });
+    return { ok: true, status: 200, decision: "escalate", sent: false };
+  }
+
+  // decision logic (same as your current live)
+  let decision = null;
+  let replyText = "";
+  let nextStage = String(stage || "").toLowerCase();
+
+  if (carrierAsk == null && looksLikeRateRequest(email_text)) {
+    decision = "quote_low";
+    replyText = msgAround(low);
+    nextStage = "initial_sent";
+  } else if (carrierAsk == null) {
+    decision = "ask_rate";
+    replyText = "What rate are you looking for?";
+    nextStage = nextStage || "";
+  } else if (carrierAsk <= mid) {
+    decision = "accept";
+    replyText = `Let’s do it at $${carrierAsk}.`;
+    nextStage = "done";
+  } else if (nextStage !== "next_offer_sent" && nextStage !== "midpoint_sent") {
+    decision = "counter";
+    const nextOffer = computeNextOffer({ postedRate, carrierAsk, mid });
+    replyText = msgCouldDo(nextOffer);
+    nextStage = "next_offer_sent";
+  } else {
+    decision = "final_midpoint";
+    replyText = msgBestIs(mid);
+    nextStage = "midpoint_sent";
+  }
+
+  // Send live email via Gmail API
+  const sendRes = await gmailSendEmail({
+    to: email_from,
+    subject: "",
+    text: replyText,
+    threadId: thread_id || null
+  });
+
+  await logEvent("live_negotiate_send_attempt", { ok: sendRes.ok, lane_key, decision, nextStage, carrierAsk });
+
+  if (!sendRes.ok) {
+    try {
+      await createAlert({
+        severity: "high",
+        title: "Live negotiation email failed",
+        message: sendRes.error || "Unknown error",
+        meta: { lane_key, email_from, decision }
+      });
+    } catch {}
+    return { ok: false, status: 500, error: sendRes.error };
+  }
+
+  // Update load state
+  const patch = {
+    status: (nextStage === "midpoint_sent") ? "midpoint_sent" : (nextStage === "done" ? "locked_in" : "negotiating"),
+    negotiation_stage: nextStage,
+    last_inbound_ts: new Date().toISOString(),
+    last_outbound_ts: new Date().toISOString(),
+    last_carrier_ask: carrierAsk ?? null
+  };
+
+  // If we sent a numeric offer, store it
+  const offered = parseRateFromText(replyText);
+  if (offered != null) patch.last_outbound_offer = offered;
+
+  await updateLoadOps(load.id, patch);
+
+  // If locked in -> owner alert to finalize in TAI
+  if (decision === "accept") {
+    try {
+      await createAlert({
+        severity: "high",
+        title: "Load locked in",
+        message: `“Let’s do it…” sent. Finalize booking in TAI.`,
+        meta: { lane_key, tai_load_id: load.tai_load_id || null, agreed_rate: carrierAsk }
+      });
+    } catch {}
+  }
+
+  return { ok: true, status: 200, sent: true, decision, replyText, nextStage };
 }
 
 // --------------------
@@ -697,7 +1059,6 @@ const server = http.createServer(async (req, res) => {
   if (!tablesReady) {
     try {
       await ensureTables();
-      await ensureLoadOpsLaneKeyUnique();
       tablesReady = true;
       await logEvent("server_start", { ok: true });
     } catch (e) {
@@ -834,7 +1195,6 @@ const server = http.createServer(async (req, res) => {
   // --------------------
   // ✅ Load ingest + dashboard endpoints
   // --------------------
-  // TAI (or Lovable) sends load details here. AI never writes to TAI.
   if (pathname === "/loads/ingest" && req.method === "POST") {
     const bodyText = await readBody(req);
     const parsed = safeJsonParse(bodyText);
@@ -872,7 +1232,12 @@ const server = http.createServer(async (req, res) => {
       } catch {}
     }
 
-    await logEvent("load_ingested", { tai_load_id: cleanStr(tai_load_id), lane_key: r.laneKey, status: r.status, designated: r.designated });
+    await logEvent("load_ingested", {
+      tai_load_id: cleanStr(tai_load_id),
+      lane_key: r.laneKey,
+      status: r.status,
+      designated: r.designated
+    });
     return json(res, 200, { ok: true, result: r });
   }
 
@@ -886,7 +1251,7 @@ const server = http.createServer(async (req, res) => {
   }
 
   // --------------------
-  // Draft carrier reply (still available, but production path should use live endpoints)
+  // Draft carrier reply (UNCHANGED)
   // --------------------
   if (pathname === "/draft/carrier-reply" && req.method === "POST") {
     const rules = (await getConfig("rules")) || {};
@@ -963,7 +1328,7 @@ ${JSON.stringify(loadContext)}
   }
 
   // --------------------
-  // Draft negotiate (same logic, but production should use /live/negotiate-and-send)
+  // Draft negotiate (UNCHANGED)
   // --------------------
   if (pathname === "/draft/negotiate" && req.method === "POST") {
     const bodyText = await readBody(req);
@@ -1068,9 +1433,8 @@ ${JSON.stringify(loadContext)}
   }
 
   // --------------------
-  // ✅ LIVE: send a real email (guardrails + audit)
-  // Body:
-  // { "to": "carrier@email.com", "subject": "...", "text": "...", "lane_key": "...", "load_context": {...} }
+  // ✅ LIVE: send a real email via Gmail (guardrails + audit)
+  // Body: { "to": "...", "subject": "...", "text": "...", "lane_key": "...", "load_context": {...}, "thread_id": "..." }
   // --------------------
   if (pathname === "/live/email/send" && req.method === "POST") {
     const rules = (await getConfig("rules")) || {};
@@ -1090,6 +1454,7 @@ ${JSON.stringify(loadContext)}
     const text = cleanStr(b.text) || "";
     const loadContext = normalizeLoadContext(b.load_context || {});
     const lane_key = cleanStr(b.lane_key);
+    const thread_id = cleanStr(b.thread_id);
 
     if (!to || !text) return json(res, 400, { ok: false, error: "Missing to/text" });
 
@@ -1112,8 +1477,7 @@ ${JSON.stringify(loadContext)}
       }
     }
 
-    const sendRes = await sendEmailSendGrid({ to, subject, text });
-
+    const sendRes = await gmailSendEmail({ to, subject, text, threadId: thread_id || null });
     await logEvent("live_email_send_attempt", { ok: sendRes.ok, lane_key: laneKeyFinal, to, subject });
 
     if (!sendRes.ok) {
@@ -1132,33 +1496,10 @@ ${JSON.stringify(loadContext)}
   }
 
   // --------------------
-  // ✅ LIVE: negotiate + send (this is your “autopilot” endpoint)
-  //
-  // Body:
-  // {
-  //   "lane_key": "seymour,IN->cookeville,TN",  (preferred)
-  //   "email_from": "carrier@email.com",
-  //   "email_text": "Can you do $900?",
-  //   "stage": "next_offer_sent" | "midpoint_sent" | ...
-  // }
-  //
-  // It will:
-  //  - load load_ops by lane_key
-  //  - run negotiation
-  //  - if decision needs message => send live email automatically
-  //  - update load_ops stage timestamps
-  //  - if "Let’s do it" => owner alert to finalize in TAI
-  //  - if carrier stops responding -> /jobs/tick handles it
+  // ✅ LIVE: negotiate + send (autopilot) (keeps your exact logic)
+  // Body: { "lane_key": "...", "email_from": "...", "email_text": "...", "stage": "...", "thread_id": "..." }
   // --------------------
   if (pathname === "/live/negotiate-and-send" && req.method === "POST") {
-    const rules = (await getConfig("rules")) || {};
-
-    const cap = requireLiveCapability(rules, "email");
-    if (!cap.ok) {
-      await logEvent("live_negotiate_blocked", { reason: cap.reason });
-      return json(res, 403, { ok: false, error: "Live actions disabled", reason: cap.reason });
-    }
-
     const bodyText = await readBody(req);
     const parsed = safeJsonParse(bodyText);
     if (!parsed.ok) return json(res, 400, { error: "Invalid JSON body" });
@@ -1168,146 +1509,100 @@ ${JSON.stringify(loadContext)}
     const email_from = cleanStr(b.email_from);
     const email_text = (b.email_text || "").toString().slice(0, 12000);
     const stage = String(b.stage || "").toLowerCase();
+    const thread_id = cleanStr(b.thread_id);
 
-    if (!lane_key || !email_from || !email_text) return json(res, 400, { ok: false, error: "Missing lane_key/email_from/email_text" });
+    if (!lane_key || !email_from || !email_text) {
+      return json(res, 400, { ok: false, error: "Missing lane_key/email_from/email_text" });
+    }
 
-    const load = await getLoadByLaneKey(lane_key);
-    if (!load) return json(res, 404, { ok: false, error: "No load found for lane_key. Ingest it first." });
+    const out = await runLiveNegotiateAndSend({ lane_key, email_from, email_text, stage, thread_id });
+    return json(res, out.status || 200, out);
+  }
 
-    if (load.is_designated) {
+  // --------------------
+  // ✅ Gmail inbound processor (AUTO)
+  // Body: { "message_id": "...", "stage_override": "..." }
+  // - fetches Gmail message
+  // - detects lane from subject/body
+  // - matches to latest load_ops on lane
+  // - runs the same live negotiate-and-send logic (no change to wording)
+  // - marks message read if handled
+  // --------------------
+  if (pathname === "/inbound/gmail/process" && req.method === "POST") {
+    const bodyText = await readBody(req);
+    const parsed = safeJsonParse(bodyText);
+    if (!parsed.ok) return json(res, 400, { error: "Invalid JSON body" });
+
+    const message_id = cleanStr(parsed.value?.message_id);
+    const stage_override = cleanStr(parsed.value?.stage_override);
+
+    if (!message_id) return json(res, 400, { ok: false, error: "Missing message_id" });
+
+    const msg = await gmailGetMessage(message_id);
+    if (!msg.ok) {
+      await logEvent("gmail_inbound_fetch_failed", { message_id, error: msg.error });
+      return json(res, 500, { ok: false, error: msg.error });
+    }
+
+    const lane = extractCityStateLaneFromText(msg.subject, msg.text);
+    if (!lane) {
       try {
         await createAlert({
           severity: "high",
-          title: "Designated lane — autopilot blocked",
-          message: "Carrier message received but AI is blocked on this lane.",
-          meta: { lane_key, email_from }
+          title: "Inbound email — lane not detected",
+          message: "Could not detect pickup/delivery from inbound email.",
+          meta: { message_id, subject: msg.subject }
         });
       } catch {}
-      await logEvent("live_negotiate_blocked_designated", { lane_key, email_from });
-      return json(res, 200, { ok: true, blocked: true, reason: "designated_lane" });
+      await logEvent("gmail_inbound_lane_not_detected", { message_id });
+      // Do not mark read; owner may want to see it
+      return json(res, 200, { ok: true, handled: false, reason: "lane_not_detected" });
     }
 
-    // validate RateView required
-    const postedRate = numOrNull(load.posted_rate);
-    const low = numOrNull(load.rateview_low);
-    const high = numOrNull(load.rateview_high);
-    const mid = numOrNull(load.midpoint_rate) ?? midpointFromLowHigh(low, high);
-
-    if (!postedRate || !low || !high || !mid) {
+    const match = await findLatestLoadByCityState(lane);
+    if (!match.ok || !match.load) {
       try {
         await createAlert({
           severity: "high",
-          title: "Autopilot blocked — missing RateView",
-          message: "Load missing posted/low/high/mid; AI cannot run live.",
-          meta: { lane_key }
+          title: "Inbound email — no matching load",
+          message: "Carrier email came in but no matching active load was found in load_ops.",
+          meta: { message_id, pickup: lane.pickup_city_state, delivery: lane.delivery_city_state, subject: msg.subject }
         });
       } catch {}
-      await updateLoadOps(load.id, { status: "blocked_missing_data" });
-      await logEvent("live_negotiate_blocked_missing_data", { lane_key });
-      return json(res, 400, { ok: false, error: "Missing required RateView/posted rates for live autopilot." });
+      await logEvent("gmail_inbound_no_matching_load", { message_id, lane_key: match.laneKey || null });
+      // Do not mark read
+      return json(res, 200, { ok: true, handled: false, reason: "no_matching_load", lane_key: match.laneKey || null });
     }
 
-    // parse carrier ask
-    let carrierAsk = parseRateFromText(email_text);
-
-    // above high => owner alert only, no email
-    if (carrierAsk != null && carrierAsk > high) {
-      try {
-        await createAlert({
-          severity: "high",
-          title: "Carrier ask above high",
-          message: `Carrier asked $${carrierAsk} (above high $${high}). Owner handle.`,
-          meta: { lane_key, carrierAsk, high }
-        });
-      } catch {}
-      await updateLoadOps(load.id, { status: "negotiating", last_carrier_ask: carrierAsk, last_inbound_ts: new Date().toISOString() });
-      await logEvent("live_negotiate_escalate_above_high", { lane_key, carrierAsk, high });
-      return json(res, 200, { ok: true, decision: "escalate", sent: false });
+    const lane_key = match.laneKey;
+    const email_from = extractEmailAddress(msg.from);
+    if (!email_from) {
+      await logEvent("gmail_inbound_missing_from", { message_id, lane_key });
+      return json(res, 400, { ok: false, error: "Could not parse From address" });
     }
 
-    // decision logic (same as draft)
-    let decision = null;
-    let replyText = "";
-    let nextStage = stage || "";
+    // Use the stage stored on the load unless overridden
+    const stage = stage_override || String(match.load.negotiation_stage || "").toLowerCase();
 
-    if (carrierAsk == null && looksLikeRateRequest(email_text)) {
-      decision = "quote_low";
-      replyText = msgAround(low);
-      nextStage = "initial_sent";
-    } else if (carrierAsk == null) {
-      decision = "ask_rate";
-      replyText = "What rate are you looking for?";
-      nextStage = stage || "";
-    } else if (carrierAsk <= mid) {
-      decision = "accept";
-      replyText = `Let’s do it at $${carrierAsk}.`;
-      nextStage = "done";
-    } else if (stage !== "next_offer_sent" && stage !== "midpoint_sent") {
-      decision = "counter";
-      const nextOffer = computeNextOffer({ postedRate, carrierAsk, mid });
-      replyText = msgCouldDo(nextOffer);
-      nextStage = "next_offer_sent";
-    } else {
-      decision = "final_midpoint";
-      replyText = msgBestIs(mid);
-      nextStage = "midpoint_sent";
-    }
-
-    // Send live email
-    const sendRes = await sendEmailSendGrid({
-      to: email_from,
-      subject: "", // keep blank unless you want to set a standard subject format
-      text: replyText
+    const out = await runLiveNegotiateAndSend({
+      lane_key,
+      email_from,
+      email_text: msg.text,
+      stage,
+      thread_id: msg.threadId || null
     });
 
-    await logEvent("live_negotiate_send_attempt", { ok: sendRes.ok, lane_key, decision, nextStage, carrierAsk });
-
-    if (!sendRes.ok) {
-      try {
-        await createAlert({
-          severity: "high",
-          title: "Live negotiation email failed",
-          message: sendRes.error || "Unknown error",
-          meta: { lane_key, email_from, decision }
-        });
-      } catch {}
-      return json(res, 500, { ok: false, error: sendRes.error });
+    // Mark read only if we handled it successfully or it was explicitly blocked designated
+    if (out?.ok === true) {
+      try { await gmailMarkRead(message_id); } catch {}
     }
 
-    // Update load state
-    const patch = {
-      status: (nextStage === "midpoint_sent") ? "midpoint_sent" : (nextStage === "done" ? "locked_in" : "negotiating"),
-      negotiation_stage: nextStage,
-      last_inbound_ts: new Date().toISOString(),
-      last_outbound_ts: new Date().toISOString(),
-      last_carrier_ask: carrierAsk ?? null
-    };
-
-    // If we sent a numeric offer, store it
-    const offered = parseRateFromText(replyText);
-    if (offered != null) patch.last_outbound_offer = offered;
-
-    await updateLoadOps(load.id, patch);
-
-    // If locked in -> owner alert to finalize in TAI
-    if (decision === "accept") {
-      try {
-        await createAlert({
-          severity: "high",
-          title: "Load locked in",
-          message: `“Let’s do it…” sent. Finalize booking in TAI.`,
-          meta: { lane_key, tai_load_id: load.tai_load_id || null, agreed_rate: carrierAsk }
-        });
-      } catch {}
-    }
-
-    return json(res, 200, { ok: true, sent: true, decision, replyText, nextStage });
+    await logEvent("gmail_inbound_processed", { message_id, lane_key, ok: out?.ok === true, decision: out?.decision || null });
+    return json(res, 200, { ok: true, handled: true, message_id, lane_key, decision: out?.decision || null, sent: out?.sent || false });
   }
 
   // --------------------
   // ✅ LIVE: DAT posting (scaffold)
-  // This endpoint changes DB state and logs. Actual DAT API call is configurable later.
-  //
   // Body: { "lane_key": "...", "dry_run": true|false }
   // --------------------
   if (pathname === "/live/dat/post" && req.method === "POST") {
@@ -1344,7 +1639,6 @@ ${JSON.stringify(loadContext)}
       return json(res, 200, { ok: true, blocked: true, reason: "designated_lane" });
     }
 
-    // required fields check
     const requiredOk =
       cleanStr(load.pickup_city_state) &&
       cleanStr(load.delivery_city_state) &&
@@ -1367,8 +1661,7 @@ ${JSON.stringify(loadContext)}
       return json(res, 400, { ok: false, error: "Missing required load data/RateView." });
     }
 
-    // ✅ Actual DAT API call is intentionally abstracted until you plug in DAT credentials + endpoint.
-    // For now, we generate a safe placeholder ID in non-dry-run so state machines work.
+    // Placeholder post id (until DAT API creds provided)
     const fakeDatPostId = `dat_${Date.now()}`;
 
     if (!dry_run) {
@@ -1381,7 +1674,6 @@ ${JSON.stringify(loadContext)}
     }
 
     await logEvent("live_dat_post", { lane_key, dry_run, dat_post_id: dry_run ? null : fakeDatPostId });
-
     return json(res, 200, { ok: true, dry_run, dat_post_id: dry_run ? null : fakeDatPostId });
   }
 
@@ -1410,7 +1702,6 @@ ${JSON.stringify(loadContext)}
 
     if (!load.dat_post_id) return json(res, 400, { ok: false, error: "Load has no dat_post_id yet (post first)." });
 
-    // scaffold: update DB refresh bookkeeping
     if (!dry_run) {
       await updateLoadOps(load.id, {
         dat_last_refresh_ts: new Date().toISOString(),
@@ -1419,23 +1710,24 @@ ${JSON.stringify(loadContext)}
     }
 
     await logEvent("live_dat_update", { lane_key, new_rate, dry_run, dat_post_id: load.dat_post_id });
-
     return json(res, 200, { ok: true, dry_run, dat_post_id: load.dat_post_id });
   }
 
   // --------------------
-  // ✅ JOB TICK: run scheduled tasks (call this from Render Cron, Uptimerobot, or Lovable)
-  // - detect midpoint silence and alert
-  // - refresh DAT posts (stub hook)
+  // ✅ JOB TICK: scheduled tasks
+  // - midpoint silence alerts
+  // - (optional) Gmail poll + auto process
   //
   // Query params:
   //   ?max=25
+  //   ?gmail=1  (enable gmail polling within this tick)
   // --------------------
   if (pathname === "/jobs/tick" && req.method === "POST") {
     const max = Math.max(1, Math.min(200, Number(urlObj.searchParams.get("max") || 25)));
+    const doGmail = urlObj.searchParams.get("gmail") === "1";
 
     const rules = (await getConfig("rules")) || {};
-    const silenceMinutes = Number(rules?.negotiation?.silence_minutes_after_midpoint || 60); // default 60 minutes
+    const silenceMinutes = Number(rules?.negotiation?.silence_minutes_after_midpoint || 60);
     const silenceMs = Math.max(5, silenceMinutes) * 60 * 1000;
 
     // 1) Midpoint silence check
@@ -1470,25 +1762,54 @@ ${JSON.stringify(loadContext)}
       }
     }
 
-    // 2) DAT refresh hook (scaffold) — you’ll plug in your exact refresh/rate-bump rules here
-    // Find posted loads that need refresh by time window rule.
-    const r2 = await pool.query(
-      `
-      SELECT id, lane_key, dat_post_id, dat_last_refresh_ts, dat_refresh_count
-      FROM load_ops
-      WHERE status = 'posted_to_dat'
-      ORDER BY id DESC
-      LIMIT $1
-      `,
-      [max]
-    );
+    // 2) Gmail polling (optional) — processes newest unread messages
+    let gmailProcessed = 0;
+    let gmailErrors = 0;
 
-    // For now we do nothing other than report how many are eligible.
-    const datCandidates = (r2.rows || []).length;
+    if (doGmail) {
+      const q = process.env.GMAIL_POLL_QUERY || "is:unread newer_than:1d";
+      const list = await gmailListMessages({ q, maxResults: Math.min(25, max) });
+      if (!list.ok) {
+        gmailErrors++;
+        await logEvent("job_gmail_poll_failed", { error: list.error });
+      } else {
+        for (const m of list.messages || []) {
+          const message_id = m.id;
+          if (!message_id) continue;
 
-    await logEvent("jobs_tick", { silenceAlerts, datCandidates, ts: nowISO() });
+          const msg = await gmailGetMessage(message_id);
+          if (!msg.ok) { gmailErrors++; continue; }
 
-    return json(res, 200, { ok: true, silenceAlerts, datCandidates });
+          const lane = extractCityStateLaneFromText(msg.subject, msg.text);
+          if (!lane) continue;
+
+          const match = await findLatestLoadByCityState(lane);
+          if (!match.ok || !match.load) continue;
+
+          const lane_key = match.laneKey;
+          const email_from = extractEmailAddress(msg.from);
+          if (!email_from) continue;
+
+          const stage = String(match.load.negotiation_stage || "").toLowerCase();
+          const out = await runLiveNegotiateAndSend({
+            lane_key,
+            email_from,
+            email_text: msg.text,
+            stage,
+            thread_id: msg.threadId || null
+          });
+
+          if (out?.ok === true) {
+            try { await gmailMarkRead(message_id); } catch {}
+            gmailProcessed++;
+            await logEvent("job_gmail_message_processed", { message_id, lane_key, decision: out?.decision || null });
+          }
+        }
+      }
+    }
+
+    await logEvent("jobs_tick", { silenceAlerts, gmailProcessed, gmailErrors, ts: nowISO() });
+    return json(res, 200, { ok: true, silenceAlerts, gmailProcessed, gmailErrors });
   }
 
   await logEvent("unknown_route", { path: req.url, method: req.method });
