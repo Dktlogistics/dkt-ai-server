@@ -47,6 +47,33 @@ async function ensureTables() {
       meta JSONB NOT NULL DEFAULT '{}'::jsonb
     );
   `);
+
+  // ✅ NEW: Designated lanes table (Lovable-controlled)
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS designated_lanes (
+      id BIGSERIAL PRIMARY KEY,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      is_active BOOLEAN NOT NULL DEFAULT TRUE,
+
+      pickup_city TEXT,
+      pickup_state TEXT,
+      delivery_city TEXT,
+      delivery_state TEXT,
+
+      // Optional: exact string lane key if you prefer "City, ST -> City, ST"
+      lane_key TEXT,
+
+      notes TEXT,
+      created_by TEXT
+    );
+  `);
+
+  // Helpful index for quick matching
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS designated_lanes_active_idx
+    ON designated_lanes (is_active);
+  `);
 }
 
 async function logEvent(eventType, details = {}) {
@@ -98,6 +125,101 @@ async function listAlerts(limit = 25) {
     [lim]
   );
   return r.rows || [];
+}
+
+// --------------------
+// ✅ Designated Lanes - DB helpers
+// --------------------
+function cleanStr(x) {
+  if (x === null || x === undefined) return null;
+  const s = String(x).trim();
+  return s.length ? s : null;
+}
+function normCity(x) {
+  const s = cleanStr(x);
+  return s ? s.toLowerCase() : null;
+}
+function normState(x) {
+  const s = cleanStr(x);
+  return s ? s.toUpperCase() : null;
+}
+function makeLaneKey(pickupCity, pickupState, deliveryCity, deliveryState) {
+  const pc = normCity(pickupCity);
+  const ps = normState(pickupState);
+  const dc = normCity(deliveryCity);
+  const ds = normState(deliveryState);
+  if (!pc || !ps || !dc || !ds) return null;
+  return `${pc},${ps}->${dc},${ds}`;
+}
+
+async function listDesignatedLanes(limit = 200) {
+  const lim = Math.max(1, Math.min(500, Number(limit) || 200));
+  const r = await pool.query(
+    `SELECT id, created_at, updated_at, is_active,
+            pickup_city, pickup_state, delivery_city, delivery_state,
+            lane_key, notes, created_by
+     FROM designated_lanes
+     WHERE is_active = TRUE
+     ORDER BY id DESC
+     LIMIT $1`,
+    [lim]
+  );
+  return r.rows || [];
+}
+
+async function addDesignatedLane({ pickup_city, pickup_state, delivery_city, delivery_state, lane_key, notes, created_by }) {
+  const pc = cleanStr(pickup_city);
+  const ps = normState(pickup_state);
+  const dc = cleanStr(delivery_city);
+  const ds = normState(delivery_state);
+
+  let lk = cleanStr(lane_key);
+  if (!lk) lk = makeLaneKey(pc, ps, dc, ds);
+
+  const r = await pool.query(
+    `INSERT INTO designated_lanes
+      (pickup_city, pickup_state, delivery_city, delivery_state, lane_key, notes, created_by)
+     VALUES ($1,$2,$3,$4,$5,$6,$7)
+     RETURNING id, lane_key`,
+    [pc, ps, dc, ds, lk, cleanStr(notes), cleanStr(created_by)]
+  );
+  return r.rows?.[0] || null;
+}
+
+async function removeDesignatedLaneById(id) {
+  await pool.query(
+    `UPDATE designated_lanes
+     SET is_active = FALSE, updated_at = NOW()
+     WHERE id = $1`,
+    [Number(id)]
+  );
+}
+
+async function removeDesignatedLaneByKey(laneKey) {
+  await pool.query(
+    `UPDATE designated_lanes
+     SET is_active = FALSE, updated_at = NOW()
+     WHERE lane_key = $1 AND is_active = TRUE`,
+    [String(laneKey)]
+  );
+}
+
+async function replaceDesignatedLanesBulk(lanes = [], created_by = "lovable_bulk") {
+  // Soft-disable all current active lanes
+  await pool.query(`UPDATE designated_lanes SET is_active = FALSE, updated_at = NOW() WHERE is_active = TRUE`);
+
+  // Insert new set
+  for (const lane of lanes) {
+    await addDesignatedLane({
+      pickup_city: lane.pickup_city,
+      pickup_state: lane.pickup_state,
+      delivery_city: lane.delivery_city,
+      delivery_state: lane.delivery_state,
+      lane_key: lane.lane_key,
+      notes: lane.notes,
+      created_by
+    });
+  }
 }
 
 // --------------------
@@ -266,6 +388,35 @@ function computeNextOffer({ postedRate, carrierAsk, mid }) {
 }
 
 // --------------------
+// ✅ Designated Lane match helper
+// --------------------
+function splitCityState(cityStateStr) {
+  const s = cleanStr(cityStateStr);
+  if (!s) return { city: null, state: null };
+  // Accept formats: "Seymour IN" | "Seymour, IN" | "Seymour,IN"
+  const m = s.match(/^(.+?)[,\s]+([A-Za-z]{2})$/);
+  if (!m) return { city: s, state: null };
+  return { city: m[1].trim(), state: m[2].toUpperCase() };
+}
+
+async function isDesignatedLane(loadContext) {
+  // Try to build lane from load_context pickup/delivery city/state strings
+  const pick = splitCityState(loadContext?.pickup_city_state);
+  const del = splitCityState(loadContext?.delivery_city_state);
+
+  const laneKey = makeLaneKey(pick.city, pick.state, del.city, del.state);
+  if (!laneKey) return false;
+
+  const r = await pool.query(
+    `SELECT id FROM designated_lanes
+     WHERE is_active = TRUE AND lane_key = $1
+     LIMIT 1`,
+    [laneKey]
+  );
+  return (r.rows?.length || 0) > 0;
+}
+
+// --------------------
 // Server
 // --------------------
 let tablesReady = false;
@@ -295,6 +446,81 @@ const server = http.createServer(async (req, res) => {
   if (pathname === "/health" && req.method === "GET") {
     await logEvent("health_check", {});
     return json(res, 200, { ok: true });
+  }
+
+  // --------------------
+  // ✅ Designated lane endpoints (Lovable control panel)
+  // --------------------
+  if (pathname === "/lanes/designated" && req.method === "GET") {
+    const limit = urlObj.searchParams.get("limit") || "200";
+    const lanes = await listDesignatedLanes(limit);
+    await logEvent("designated_lanes_listed", { count: lanes.length });
+    return json(res, 200, { ok: true, lanes });
+  }
+
+  if (pathname === "/lanes/designated" && req.method === "POST") {
+    const bodyText = await readBody(req);
+    const parsed = safeJsonParse(bodyText);
+    if (!parsed.ok) return json(res, 400, { error: "Invalid JSON body" });
+
+    const b = parsed.value || {};
+    const pickup_city = b.pickup_city;
+    const pickup_state = b.pickup_state;
+    const delivery_city = b.delivery_city;
+    const delivery_state = b.delivery_state;
+    const notes = b.notes || "";
+    const created_by = b.created_by || "lovable";
+
+    // Either explicit lane_key OR all city/state required
+    const lane_key = b.lane_key || null;
+
+    const inserted = await addDesignatedLane({
+      pickup_city,
+      pickup_state,
+      delivery_city,
+      delivery_state,
+      lane_key,
+      notes,
+      created_by
+    });
+
+    await logEvent("designated_lane_added", { id: inserted?.id, lane_key: inserted?.lane_key });
+
+    return json(res, 200, { ok: true, added: inserted });
+  }
+
+  if (pathname === "/lanes/designated" && req.method === "DELETE") {
+    const id = urlObj.searchParams.get("id");
+    const lane_key = urlObj.searchParams.get("lane_key");
+
+    if (id) {
+      await removeDesignatedLaneById(id);
+      await logEvent("designated_lane_removed", { id });
+      return json(res, 200, { ok: true, removed: { id: Number(id) } });
+    }
+
+    if (lane_key) {
+      await removeDesignatedLaneByKey(lane_key);
+      await logEvent("designated_lane_removed", { lane_key });
+      return json(res, 200, { ok: true, removed: { lane_key } });
+    }
+
+    return json(res, 400, { error: "Provide ?id= or ?lane_key=" });
+  }
+
+  if (pathname === "/lanes/designated/bulk" && req.method === "POST") {
+    const bodyText = await readBody(req);
+    const parsed = safeJsonParse(bodyText);
+    if (!parsed.ok) return json(res, 400, { error: "Invalid JSON body" });
+
+    const b = parsed.value || {};
+    const lanes = Array.isArray(b.lanes) ? b.lanes : [];
+    const created_by = b.created_by || "lovable_bulk";
+
+    await replaceDesignatedLanesBulk(lanes, created_by);
+    await logEvent("designated_lanes_bulk_replace", { count: lanes.length });
+
+    return json(res, 200, { ok: true, replaced_count: lanes.length });
   }
 
   // Rules config
@@ -346,7 +572,7 @@ const server = http.createServer(async (req, res) => {
     return json(res, 200, { ok: true, alerts });
   }
 
-  // Draft carrier reply (kept from your design)
+  // Draft carrier reply
   if (pathname === "/draft/carrier-reply" && req.method === "POST") {
     const rules = (await getConfig("rules")) || {};
     const safetyMode = rules?.safety?.mode || "draft_only";
@@ -363,6 +589,34 @@ const server = http.createServer(async (req, res) => {
     if (!emailText) return json(res, 400, { error: "Missing email_text" });
 
     const loadContext = normalizeLoadContext(body.load_context || {});
+
+    // ✅ HARD GUARDRAIL: designated lanes are owner-only
+    const designated = await isDesignatedLane(loadContext);
+    if (designated) {
+      try {
+        await createAlert({
+          severity: "high",
+          title: "Designated lane — AI blocked",
+          message: `Carrier email received on designated lane. AI will not respond.`,
+          meta: { lane_guess: loadContext?.lane_guess || null, pickup: loadContext?.pickup_city_state, delivery: loadContext?.delivery_city_state }
+        });
+      } catch {}
+
+      await logEvent("draft_carrier_reply_blocked_designated", {
+        pickup: loadContext?.pickup_city_state,
+        delivery: loadContext?.delivery_city_state
+      });
+
+      return json(res, 200, {
+        ok: true,
+        result: {
+          blocked: true,
+          reason: "designated_lane",
+          draft_reply_text: "",
+          notes_for_owner: "Designated lane — handle manually."
+        }
+      });
+    }
 
     const system = `
 You are DKT Logistics' carrier email assistant.
@@ -413,14 +667,7 @@ ${JSON.stringify(loadContext)}
     return json(res, 200, { ok: true, result });
   }
 
-  // --------------------
-  // UPDATED /draft/negotiate (your exact script)
-  //
-  // 1) If carrier asks "rate?" with no number => "We are looking to be around $LOW."
-  // 2) If carrier counters higher => "We could do $NEXT_OFFER."
-  // 3) Next time after that => "My best is $MIDPOINT."
-  // 4) After midpoint is sent, if silent/no response => alert owner when your system calls with no_response_after_midpoint=true
-  // --------------------
+  // Draft negotiation (unchanged logic, but now blocks designated lanes)
   if (pathname === "/draft/negotiate" && req.method === "POST") {
     const bodyText = await readBody(req);
     const parsed = safeJsonParse(bodyText);
@@ -440,6 +687,33 @@ ${JSON.stringify(loadContext)}
     if (loadContext.rateview_low == null && body.rateview_low != null) loadContext.rateview_low = body.rateview_low;
     if (loadContext.rateview_high == null && body.rateview_high != null) loadContext.rateview_high = body.rateview_high;
 
+    // ✅ HARD GUARDRAIL: block designated lanes
+    const designated = await isDesignatedLane(loadContext);
+    if (designated) {
+      try {
+        await createAlert({
+          severity: "high",
+          title: "Designated lane — negotiation blocked",
+          message: `AI blocked negotiation attempt on designated lane.`,
+          meta: { pickup: loadContext?.pickup_city_state, delivery: loadContext?.delivery_city_state }
+        });
+      } catch {}
+
+      await logEvent("draft_negotiate_blocked_designated", {
+        pickup: loadContext?.pickup_city_state,
+        delivery: loadContext?.delivery_city_state
+      });
+
+      return json(res, 200, {
+        ok: true,
+        result: {
+          decision: "blocked_designated_lane",
+          draft_reply_text: "",
+          reasoning: "Designated lane: owner-controlled; AI must not negotiate."
+        }
+      });
+    }
+
     const lane = loadContext.lane_guess || null;
 
     const postedRate = numOrNull(loadContext.posted_rate);
@@ -451,12 +725,8 @@ ${JSON.stringify(loadContext)}
     let carrierAsk = numOrNull(body.carrier_ask_rate);
     if (carrierAsk == null) carrierAsk = parseRateFromText(emailText);
 
-    // stage control (so we know what we already sent)
-    // "initial_sent" -> we already sent the LOW message
-    // "next_offer_sent" -> we already sent the NEXT offer (685-style)
-    // "midpoint_sent" -> we already sent midpoint
+    // stage control
     const stage = String(body.stage || "").toLowerCase();
-
     const noResponseAfterMidpoint = body.no_response_after_midpoint === true;
 
     if (postedRate == null || postedRate <= 0) {
@@ -492,9 +762,8 @@ ${JSON.stringify(loadContext)}
       });
     }
 
-    // After midpoint: if silence flag is set, alert owner (especially if within $100 of midpoint)
+    // After midpoint: if silence flag is set, alert owner
     if (stage === "midpoint_sent" && noResponseAfterMidpoint) {
-      // Use last known ask if provided, else try parse again
       const lastAsk = carrierAsk;
       const within100 = lastAsk != null ? (Math.abs(lastAsk - mid) <= 100) : false;
 
@@ -567,8 +836,7 @@ ${JSON.stringify(loadContext)}
       });
     }
 
-    // 2) When they counter (first time we have a number above midpoint)
-    // If we have NOT already sent next-offer, send "We could do $NEXT."
+    // 2) First counter above midpoint: "We could do $NEXT."
     if (stage !== "next_offer_sent" && stage !== "midpoint_sent") {
       const nextOffer = computeNextOffer({ postedRate, carrierAsk, mid });
 
@@ -598,8 +866,7 @@ ${JSON.stringify(loadContext)}
       });
     }
 
-    // 3) Last counter offer: "My best is midpoint."
-    // If we already sent next offer, now go midpoint.
+    // 3) Last counter: midpoint
     await logEvent("draft_negotiate", { lane, step: "midpoint_best", postedRate, low, high, mid, carrierAsk });
 
     return json(res, 200, {
