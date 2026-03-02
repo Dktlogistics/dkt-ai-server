@@ -560,7 +560,7 @@ ${JSON.stringify(loadContext)}
         ok: true,
         result: {
           decision: "accept",
-          draft_reply_text: "Let’s do it.",
+          draft_reply_text: `Let’s do it at $${carrierAsk}.`,
           reasoning: `Carrier is at/below midpoint (carrier $${carrierAsk}, midpoint $${mid}). Lock it.`,
           next_stage: "done"
         }
